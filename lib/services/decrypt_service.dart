@@ -1,7 +1,5 @@
-// ignore_for_file: unused_import
 import 'dart:io';
 import 'dart:async';
-import 'dart:convert';
 import 'dart:typed_data';
 import 'dart:isolate';
 import 'package:path_provider/path_provider.dart';
@@ -52,7 +50,9 @@ class DecryptService {
   static const int ivSize = 16;
   static const int keySize = 32;
   static const int reserveSize = 80;
-  static const String sqliteHeader = "SQLite format 3\x00";
+  static final List<int> sqliteHeader = [
+    83, 81, 76, 105, 116, 101, 32, 102, 111, 114, 109, 97, 116, 32, 51, 0
+  ]; // "SQLite format 3\x00" 的字节表示
 
   /// 初始化服务（兼容性方法）
   Future<void> initialize() async {
@@ -176,7 +176,7 @@ class DecryptService {
 
       // 创建输出缓冲区
       final decryptedData = BytesBuilder();
-      decryptedData.add(utf8.encode(sqliteHeader));
+      decryptedData.add(sqliteHeader);
 
       // 解密所有页面
       for (int pageNum = 0; pageNum < totalPages; pageNum++) {
@@ -194,11 +194,8 @@ class DecryptService {
 
         // 检查是否全为零
         if (_isAllZerosStatic(page)) {
-          if (pageNum == 0) {
-            decryptedData.add(page.sublist(saltSize));
-          } else {
-            decryptedData.add(page);
-          }
+          // 全零页面直接添加，不做特殊处理
+          decryptedData.add(page);
         } else {
           // 解密页面
           // 第一页总是验证HMAC（确保密钥正确），其他页面可选跳过
@@ -329,8 +326,11 @@ class DecryptService {
 
   /// 检查数据库是否已经解密
   bool _isAlreadyDecrypted(List<int> firstPage) {
-    final header = String.fromCharCodes(firstPage.sublist(0, sqliteHeader.length - 1));
-    return header == sqliteHeader.substring(0, sqliteHeader.length - 1);
+    if (firstPage.length < sqliteHeader.length) return false;
+    for (int i = 0; i < sqliteHeader.length - 1; i++) {
+      if (firstPage[i] != sqliteHeader[i]) return false;
+    }
+    return true;
   }
 
   /// 十六进制字符串转字节数组

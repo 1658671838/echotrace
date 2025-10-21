@@ -8,6 +8,7 @@ import '../models/message.dart';
 import '../models/contact.dart';
 import '../models/chat_session.dart';
 import 'wechat_vfs_native.dart';
+import 'logger_service.dart';
 
 /// 数据库读取模式
 enum DatabaseMode {
@@ -49,36 +50,46 @@ class DatabaseService {
   /// 连接解密后的数据库（作为会话库）
   /// [factory] 可选的数据库工厂，用于 Isolate 中避免全局修改
   Future<void> connectDecryptedDatabase(String dbPath, {DatabaseFactory? factory}) async {
-    if (!File(dbPath).existsSync()) {
-      throw Exception('解密后的数据库文件不存在');
+    try {
+      await logger.info('DatabaseService', '尝试连接解密后的数据库: $dbPath');
+      
+      if (!File(dbPath).existsSync()) {
+        await logger.error('DatabaseService', '数据库文件不存在: $dbPath');
+        throw Exception('解密后的数据库文件不存在');
+      }
+
+      // 保存工厂实例供后续使用
+      if (factory != null) {
+        _dbFactory = factory;
+      }
+
+      // 关闭旧的会话库连接（消息库保持不动）
+      if (_sessionDb != null) {
+        await _sessionDb!.close();
+        _sessionDb = null;
+      }
+
+      // 使用指定的工厂或已保存的工厂或默认工厂
+      final dbFactory = factory ?? _dbFactory ?? databaseFactory;
+      
+      // 以只读模式打开数据库，不指定 version 避免写入操作
+      _sessionDb = await dbFactory.openDatabase(
+        dbPath,
+        options: OpenDatabaseOptions(
+          readOnly: true,
+          singleInstance: false, // 允许多个实例，避免冲突
+        ),
+      );
+
+      _mode = DatabaseMode.decrypted;
+      _sessionDbPath = dbPath;
+      _currentAccountWxid = _extractWxidFromPath(dbPath);
+      
+      await logger.info('DatabaseService', '成功连接解密数据库，模式: ${_mode.name}');
+    } catch (e, stackTrace) {
+      await logger.error('DatabaseService', '连接解密数据库失败', e, stackTrace);
+      rethrow;
     }
-
-    // 保存工厂实例供后续使用
-    if (factory != null) {
-      _dbFactory = factory;
-    }
-
-    // 关闭旧的会话库连接（消息库保持不动）
-    if (_sessionDb != null) {
-      await _sessionDb!.close();
-      _sessionDb = null;
-    }
-
-    // 使用指定的工厂或已保存的工厂或默认工厂
-    final dbFactory = factory ?? _dbFactory ?? databaseFactory;
-    
-    // 以只读模式打开数据库，不指定 version 避免写入操作
-    _sessionDb = await dbFactory.openDatabase(
-      dbPath,
-      options: OpenDatabaseOptions(
-        readOnly: true,
-        singleInstance: false, // 允许多个实例，避免冲突
-      ),
-    );
-
-    _mode = DatabaseMode.decrypted;
-    _sessionDbPath = dbPath;
-    _currentAccountWxid = _extractWxidFromPath(dbPath);
   }
 
   /// 连接实时加密数据库（VFS拦截模式）
@@ -86,22 +97,25 @@ class DatabaseService {
   /// [hexKey] 解密密钥（64位十六进制）
   /// [factory] 可选的数据库工厂
   Future<void> connectRealtimeDatabase(String dbPath, String hexKey, {DatabaseFactory? factory}) async {
-    if (!File(dbPath).existsSync()) {
-      throw Exception('数据库文件不存在');
-    }
-
-    // 保存工厂实例供后续使用
-    if (factory != null) {
-      _dbFactory = factory;
-    }
-
-    // 关闭旧的会话库连接
-    if (_sessionDb != null) {
-      await _sessionDb!.close();
-      _sessionDb = null;
-    }
-    
     try {
+      await logger.info('DatabaseService', '尝试连接实时加密数据库: $dbPath');
+      
+      if (!File(dbPath).existsSync()) {
+        await logger.error('DatabaseService', '数据库文件不存在: $dbPath');
+        throw Exception('数据库文件不存在');
+      }
+
+      // 保存工厂实例供后续使用
+      if (factory != null) {
+        _dbFactory = factory;
+      }
+
+      // 关闭旧的会话库连接
+      if (_sessionDb != null) {
+        await _sessionDb!.close();
+        _sessionDb = null;
+      }
+    
       // 使用真正的VFS拦截打开加密数据库
       // 在SQLite文件系统层面拦截xRead操作，实时解密数据页
       _sessionDb = await WeChatVFSNative.openEncryptedDatabase(dbPath, hexKey);
@@ -109,9 +123,11 @@ class DatabaseService {
       _mode = DatabaseMode.realtime;
       _sessionDbPath = dbPath;
       _currentAccountWxid = _extractWxidFromPath(dbPath);
-
-    } catch (e) {
-      rethrow; // 重新抛出异常，让上层处理
+      
+      await logger.info('DatabaseService', '成功连接实时加密数据库，模式: ${_mode.name}');
+    } catch (e, stackTrace) {
+      await logger.error('DatabaseService', '连接实时加密数据库失败', e, stackTrace);
+      rethrow;
     }
   }
   
@@ -128,6 +144,7 @@ class DatabaseService {
   Future<List<ChatSession>> getSessions() async {
     final db = _currentDb;
     if (db == null) {
+      await logger.error('DatabaseService', '获取会话列表失败：数据库未连接');
       throw Exception('数据库未连接');
     }
 
@@ -155,6 +172,11 @@ class DatabaseService {
         } else if (tableNames.contains('FMessageTable')) {
           return await _getSessionsFromFMessageTable();
         } else {
+          // 检查是否是纯消息数据库
+          final hasMsgTables = tableNames.any((t) => t.startsWith('Msg_'));
+          if (hasMsgTables) {
+            throw Exception('当前连接的是消息数据库（message_x.db），无法获取会话列表。请确保系统连接的是 session.db 或 contact.db。如果问题持续，请尝试重新解密数据库。');
+          }
           throw Exception('数据库中未找到会话表。可用的表: ${tableNames.join(", ")}');
         }
       }
@@ -1239,12 +1261,17 @@ class DatabaseService {
   /// 使用联系人信息丰富会话列表
   Future<void> _enrichSessionsWithContactInfo(List<ChatSession> sessions) async {
     try {
-      // 尝试连接 contact 数据库
-      final contactDbPath = await _findContactDatabase();
+      await logger.info('DatabaseService', '开始从contact数据库加载联系人信息，会话数量: ${sessions.length}');
+      
+      // 尝试连接 contact 数据库（带重试机制）
+      final contactDbPath = await _findContactDatabase(retryCount: 3, retryDelayMs: 500);
       if (contactDbPath == null) {
+        await logger.warning('DatabaseService', '无法找到contact数据库，会话将显示原始用户名');
         return;
       }
 
+      await logger.info('DatabaseService', '正在打开contact数据库: $contactDbPath');
+      
       // 临时连接 contact 数据库
       final contactDb = await _currentFactory.openDatabase(
         contactDbPath,
@@ -1378,11 +1405,13 @@ class DatabaseService {
             // 查找联系人失败
           }
         }
+        
+        await logger.info('DatabaseService', '成功加载联系人信息，已更新${sessions.where((s) => s.displayName != null && s.displayName!.isNotEmpty).length}个会话的显示名称');
       } finally {
         await contactDb.close();
       }
-    } catch (e) {
-      // 连接 contact 数据库失败
+    } catch (e, stackTrace) {
+      await logger.error('DatabaseService', '从contact数据库加载联系人信息失败', e, stackTrace);
     }
   }
 
@@ -1435,32 +1464,68 @@ class DatabaseService {
     }
   }
 
-  /// 查找 contact 数据库文件
-  Future<String?> _findContactDatabase() async {
-    try {
-      final documentsDir = await getApplicationDocumentsDirectory();
-      final echoTraceDir = Directory('${documentsDir.path}${Platform.pathSeparator}EchoTrace');
-      
-      if (!await echoTraceDir.exists()) return null;
-      
-      final wxidDirs = await echoTraceDir.list().where((entity) {
-        return entity is Directory && 
-               entity.path.split(Platform.pathSeparator).last.startsWith('wxid_');
-      }).toList();
-      
-      for (final wxidDir in wxidDirs) {
-        final contactDbPath = '${wxidDir.path}${Platform.pathSeparator}contact.db';
-        final contactDbFile = File(contactDbPath);
+  /// 查找 contact 数据库文件（带重试机制）
+  Future<String?> _findContactDatabase({int retryCount = 3, int retryDelayMs = 500}) async {
+    for (int attempt = 0; attempt < retryCount; attempt++) {
+      try {
+        final documentsDir = await getApplicationDocumentsDirectory();
+        final echoTraceDir = Directory('${documentsDir.path}${Platform.pathSeparator}EchoTrace');
+        
+        if (!await echoTraceDir.exists()) {
+          if (attempt == 0) {
+            await logger.warning('DatabaseService', 'EchoTrace目录不存在: ${echoTraceDir.path}');
+          }
+          if (attempt < retryCount - 1) {
+            await Future.delayed(Duration(milliseconds: retryDelayMs));
+            continue;
+          }
+          return null;
+        }
+        
+        final wxidDirs = await echoTraceDir.list().where((entity) {
+          return entity is Directory && 
+                 entity.path.split(Platform.pathSeparator).last.startsWith('wxid_');
+        }).toList();
+        
+        if (wxidDirs.isEmpty) {
+          if (attempt == 0) {
+            await logger.warning('DatabaseService', '未找到任何wxid目录');
+          }
+          if (attempt < retryCount - 1) {
+            await Future.delayed(Duration(milliseconds: retryDelayMs));
+            continue;
+          }
+          return null;
+        }
+        
+        for (final wxidDir in wxidDirs) {
+          final contactDbPath = '${wxidDir.path}${Platform.pathSeparator}contact.db';
+          final contactDbFile = File(contactDbPath);
 
-        if (await contactDbFile.exists()) {
-          return contactDbPath;
+          if (await contactDbFile.exists()) {
+            await logger.info('DatabaseService', '找到contact数据库: $contactDbPath');
+            return contactDbPath;
+          }
+        }
+        
+        if (attempt == 0) {
+          await logger.warning('DatabaseService', '在所有wxid目录中都未找到contact.db');
+        }
+        
+        if (attempt < retryCount - 1) {
+          await logger.info('DatabaseService', '将在${retryDelayMs}ms后重试查找contact.db（第${attempt + 1}次尝试失败）');
+          await Future.delayed(Duration(milliseconds: retryDelayMs));
+        }
+      } catch (e, stackTrace) {
+        await logger.error('DatabaseService', '查找contact数据库失败（尝试${attempt + 1}/$retryCount）', e, stackTrace);
+        if (attempt < retryCount - 1) {
+          await Future.delayed(Duration(milliseconds: retryDelayMs));
         }
       }
-      
-      return null;
-    } catch (e) {
-      return null;
     }
+    
+    await logger.warning('DatabaseService', '经过$retryCount次尝试，仍未找到contact数据库');
+    return null;
   }
 
   /// 获取用于消息查询的数据库

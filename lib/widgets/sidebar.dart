@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import '../providers/app_state.dart';
 
 /// 侧边栏组件（可折叠）
@@ -15,10 +16,12 @@ class _SidebarState extends State<Sidebar> with SingleTickerProviderStateMixin {
   late AnimationController _animationController;
   late Animation<double> _widthAnimation;
   bool _showContent = true; // 控制内容显示
+  String _version = '';
   
   @override
   void initState() {
     super.initState();
+    _loadVersion();
     _animationController = AnimationController(
       duration: const Duration(milliseconds: 300),
       vsync: this,
@@ -46,6 +49,15 @@ class _SidebarState extends State<Sidebar> with SingleTickerProviderStateMixin {
         });
       }
     });
+  }
+  
+  Future<void> _loadVersion() async {
+    final packageInfo = await PackageInfo.fromPlatform();
+    if (mounted) {
+      setState(() {
+        _version = 'v${packageInfo.version}';
+      });
+    }
   }
   
   @override
@@ -182,7 +194,7 @@ class _SidebarState extends State<Sidebar> with SingleTickerProviderStateMixin {
                         // 版本号居中
                         Center(
                           child: Text(
-                            'v1.0.2',
+                            _version,
                             style: Theme.of(context).textTheme.bodySmall?.copyWith(
                               color: Theme.of(context).colorScheme.onSurface.withOpacity(0.3),
                             ),

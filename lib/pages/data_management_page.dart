@@ -5,6 +5,7 @@ import 'dart:io';
 import '../providers/app_state.dart';
 import '../services/config_service.dart';
 import '../services/decrypt_service.dart';
+import '../services/logger_service.dart';
 
 /// 数据管理页面
 class DataManagementPage extends StatefulWidget {
@@ -79,7 +80,8 @@ class _DataManagementPageState extends State<DataManagementPage> {
       // 按文件大小排序，小的在前
       _databaseFiles.sort((a, b) => a.fileSize.compareTo(b.fileSize));
       
-    } catch (e) {
+    } catch (e, stackTrace) {
+      await logger.error('DataManagementPage', '加载数据库文件失败', e, stackTrace);
       _showMessage('加载数据库文件失败: $e', false);
     } finally {
       if (mounted) {
@@ -339,9 +341,18 @@ class _DataManagementPageState extends State<DataManagementPage> {
       final successCount = _decryptResults.values.where((v) => v).length;
       final failCount = _decryptResults.values.where((v) => !v).length;
 
-      // 重新连接数据库
+      // 等待文件系统完全释放文件句柄并刷新缓存（Windows需要更长时间）
+      await logger.info('DataManagementPage', '等待文件系统稳定...');
+      await Future.delayed(const Duration(milliseconds: 2500));
+
+      // 重新连接数据库（增加重试次数和延迟）
       if (mounted) {
-        await context.read<AppState>().reconnectDatabase();
+        await logger.info('DataManagementPage', '开始重新连接数据库...');
+        await context.read<AppState>().reconnectDatabase(
+          retryCount: 5,
+          retryDelay: 1500,
+        );
+        await logger.info('DataManagementPage', '数据库重新连接完成');
       }
 
       _showMessage('批量解密完成！成功: $successCount, 失败: $failCount', failCount == 0);
@@ -349,14 +360,25 @@ class _DataManagementPageState extends State<DataManagementPage> {
       // 手动刷新文件列表，确保状态（特别是isDecrypted）完全更新
       await _loadDatabaseFiles();
       
-    } catch (e) {
+    } catch (e, stackTrace) {
+      await logger.error('DataManagementPage', '批量解密失败', e, stackTrace);
       _showMessage('批量解密失败: $e', false);
+      
+      // 等待文件系统稳定
+      await logger.info('DataManagementPage', '等待文件系统稳定...');
+      await Future.delayed(const Duration(milliseconds: 2500));
       
       // 即使失败也要尝试重新连接数据库
       if (mounted) {
         try {
-          await context.read<AppState>().reconnectDatabase();
+          await logger.info('DataManagementPage', '开始重新连接数据库...');
+          await context.read<AppState>().reconnectDatabase(
+            retryCount: 5,
+            retryDelay: 1500,
+          );
+          await logger.info('DataManagementPage', '数据库重新连接完成');
         } catch (reconnectError) {
+          await logger.error('DataManagementPage', '重新连接数据库失败', reconnectError);
         }
       }
     } finally {
@@ -486,9 +508,18 @@ class _DataManagementPageState extends State<DataManagementPage> {
       final successCount = _decryptResults.values.where((v) => v).length;
       final failCount = _decryptResults.values.where((v) => !v).length;
       
-      // 重新连接数据库
+      // 等待文件系统完全释放文件句柄并刷新缓存
+      await logger.info('DataManagementPage', '等待文件系统稳定...');
+      await Future.delayed(const Duration(milliseconds: 2500));
+      
+      // 重新连接数据库（增加重试次数和延迟）
       if (mounted) {
-        await context.read<AppState>().reconnectDatabase();
+        await logger.info('DataManagementPage', '开始重新连接数据库...');
+        await context.read<AppState>().reconnectDatabase(
+          retryCount: 5,
+          retryDelay: 1500,
+        );
+        await logger.info('DataManagementPage', '数据库重新连接完成');
       }
       
       if (mounted) {
@@ -498,14 +529,25 @@ class _DataManagementPageState extends State<DataManagementPage> {
       // 手动刷新文件列表
       await _loadDatabaseFiles();
 
-    } catch (e) {
+    } catch (e, stackTrace) {
+      await logger.error('DataManagementPage', '增量更新失败', e, stackTrace);
       _showMessage('增量更新失败: $e', false);
+      
+      // 等待文件系统稳定
+      await logger.info('DataManagementPage', '等待文件系统稳定...');
+      await Future.delayed(const Duration(milliseconds: 2500));
       
       // 即使失败也要尝试重新连接数据库
       if (mounted) {
         try {
-          await context.read<AppState>().reconnectDatabase();
+          await logger.info('DataManagementPage', '开始重新连接数据库...');
+          await context.read<AppState>().reconnectDatabase(
+            retryCount: 5,
+            retryDelay: 1500,
+          );
+          await logger.info('DataManagementPage', '数据库重新连接完成');
         } catch (reconnectError) {
+          await logger.error('DataManagementPage', '重新连接数据库失败', reconnectError);
         }
       }
     } finally {
@@ -607,8 +649,17 @@ class _DataManagementPageState extends State<DataManagementPage> {
           }
         });
         
-        // 重新连接数据库
-        await context.read<AppState>().reconnectDatabase();
+        // 等待文件系统完全释放文件句柄并刷新缓存
+        await logger.info('DataManagementPage', '等待文件系统稳定...');
+        await Future.delayed(const Duration(milliseconds: 2500));
+        
+        // 重新连接数据库（增加重试次数和延迟）
+        await logger.info('DataManagementPage', '开始重新连接数据库...');
+        await context.read<AppState>().reconnectDatabase(
+          retryCount: 5,
+          retryDelay: 1500,
+        );
+        await logger.info('DataManagementPage', '数据库重新连接完成');
         
         _showMessage('解密成功: ${file.fileName}', true);
       }
@@ -621,16 +672,27 @@ class _DataManagementPageState extends State<DataManagementPage> {
           // 忽略删除错误，临时目录会被系统自动清理
         }
       });
-    } catch (e) {
+    } catch (e, stackTrace) {
+      await logger.error('DataManagementPage', '解密文件失败: ${file.fileName}', e, stackTrace);
       _showMessage('解密失败: $e', false);
       // 清理节流时间戳
       _lastProgressUpdateMap.remove(file.originalPath);
       
+      // 等待文件系统稳定
+      await logger.info('DataManagementPage', '等待文件系统稳定...');
+      await Future.delayed(const Duration(milliseconds: 2500));
+      
       // 即使失败也要尝试重新连接数据库
       if (mounted) {
         try {
-          await context.read<AppState>().reconnectDatabase();
+          await logger.info('DataManagementPage', '开始重新连接数据库...');
+          await context.read<AppState>().reconnectDatabase(
+            retryCount: 5,
+            retryDelay: 1500,
+          );
+          await logger.info('DataManagementPage', '数据库重新连接完成');
         } catch (reconnectError) {
+          await logger.error('DataManagementPage', '重新连接数据库失败', reconnectError);
         }
       }
     } finally {
