@@ -8,6 +8,7 @@ import '../widgets/message_bubble.dart';
 import '../widgets/message_loading_shimmer.dart';
 import '../utils/string_utils.dart';
 import '../services/chat_export_service.dart';
+import '../services/logger_service.dart';
 
 /// 聊天记录页面
 class ChatPage extends StatefulWidget {
@@ -76,6 +77,7 @@ class _ChatPageState extends State<ChatPage> with SingleTickerProviderStateMixin
       
       // 检查数据库是否已连接
       if (!appState.databaseService.isConnected) {
+        await logger.error('ChatPage', '数据库未连接，无法加载会话列表');
         if (mounted) {
           setState(() {
             _isLoadingSessions = false;
@@ -86,7 +88,12 @@ class _ChatPageState extends State<ChatPage> with SingleTickerProviderStateMixin
         return; // 数据库未连接，不显示错误，由UI显示提示
       }
 
+      await logger.info('ChatPage', '开始加载会话列表，数据库模式: ${appState.databaseService.mode.name}');
+      await logger.info('ChatPage', '数据库路径: ${appState.databaseService.dbPath}');
+      
       final sessions = await appState.databaseService.getSessions();
+      
+      await logger.info('ChatPage', '从数据库获取到 ${sessions.length} 个会话');
       
       // 过滤掉公众号/服务号（gh_ 开头）和其他非聊天会话
       final filteredSessions = sessions.where((session) {
@@ -102,6 +109,11 @@ class _ChatPageState extends State<ChatPage> with SingleTickerProviderStateMixin
         return session.username.contains('wxid_') || session.username.contains('@chatroom');
       }).toList();
       
+      await logger.info('ChatPage', '过滤后剩余 ${filteredSessions.length} 个会话');
+      if (filteredSessions.isNotEmpty) {
+        await logger.info('ChatPage', '前5个会话: ${filteredSessions.take(5).map((s) => '${s.username} (${s.displayName ?? "无显示名"})').join(", ")}');
+      }
+      
       if (mounted) {
         setState(() {
           _sessions = filteredSessions;
@@ -110,7 +122,8 @@ class _ChatPageState extends State<ChatPage> with SingleTickerProviderStateMixin
         _refreshController.stop();
         _refreshController.reset();
       }
-    } catch (e) {
+    } catch (e, stackTrace) {
+      await logger.error('ChatPage', '加载会话列表失败', e, stackTrace);
       if (mounted) {
         setState(() {
           _isLoadingSessions = false;
@@ -128,6 +141,8 @@ class _ChatPageState extends State<ChatPage> with SingleTickerProviderStateMixin
   }
 
   Future<void> _loadMessages(ChatSession session) async {
+    await logger.info('ChatPage', '开始加载会话消息: ${session.username} (${session.displayName ?? "无显示名"})');
+    
     // 立即切换选中状态，不等待加载，避免卡顿
     setState(() {
       _selectedSession = session;
@@ -143,14 +158,19 @@ class _ChatPageState extends State<ChatPage> with SingleTickerProviderStateMixin
     try {
       final appState = context.read<AppState>();
       const initialLoadLimit = 20; // 初次只加载20条消息
+      
+      await logger.info('ChatPage', '查询消息，limit=$initialLoadLimit, offset=0');
       final messages = await appState.databaseService.getMessages(
         session.username,
         limit: initialLoadLimit,
         offset: 0,
       );
+      
+      await logger.info('ChatPage', '获取到 ${messages.length} 条消息');
 
       // 如果是群聊，批量查询所有发送者的真实姓名
       if (session.isGroup && messages.isNotEmpty) {
+        await logger.info('ChatPage', '这是群聊，开始查询发送者显示名');
         final senderUsernames = messages
             .where((m) => m.senderUsername != null && m.senderUsername!.isNotEmpty)
             .map((m) => m.senderUsername!)
@@ -158,7 +178,9 @@ class _ChatPageState extends State<ChatPage> with SingleTickerProviderStateMixin
             .toList();
 
         if (senderUsernames.isNotEmpty) {
+          await logger.info('ChatPage', '查询 ${senderUsernames.length} 个发送者的显示名');
           _senderDisplayNames = await appState.databaseService.getDisplayNames(senderUsernames);
+          await logger.info('ChatPage', '获取到 ${_senderDisplayNames.length} 个显示名');
         }
       }
 

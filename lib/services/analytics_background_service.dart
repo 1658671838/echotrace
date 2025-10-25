@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:isolate';
+import 'dart:ui';
+import 'package:flutter/services.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import '../services/database_service.dart';
 import '../services/advanced_analytics_service.dart';
@@ -38,6 +40,7 @@ class _AnalyticsTask {
   final int? filterYear;
   final String analysisType;
   final SendPort sendPort;
+  final RootIsolateToken rootIsolateToken;
 
   _AnalyticsTask({
     required this.dbPath,
@@ -45,6 +48,7 @@ class _AnalyticsTask {
     this.filterYear,
     required this.analysisType,
     required this.sendPort,
+    required this.rootIsolateToken,
   });
 }
 
@@ -223,6 +227,7 @@ class AnalyticsBackgroundService {
         filterYear: filterYear,
         analysisType: analysisType,
         sendPort: receivePort.sendPort,
+        rootIsolateToken: ServicesBinding.rootIsolateToken!,
       );
 
       // 启动 Isolate
@@ -261,6 +266,9 @@ class AnalyticsBackgroundService {
   /// 后台 Isolate 分析入口函数
   static Future<void> _analyzeInIsolate(_AnalyticsTask task) async {
     try {
+      // 初始化 BackgroundIsolateBinaryMessenger（在 Isolate 中必须先初始化）
+      BackgroundIsolateBinaryMessenger.ensureInitialized(task.rootIsolateToken);
+      
       // 初始化 sqflite_ffi（在 Isolate 中必须重新初始化）
       sqfliteFfiInit();
       // 不全局修改 databaseFactory，而是显式传递给每个操作

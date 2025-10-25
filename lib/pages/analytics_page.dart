@@ -212,19 +212,18 @@ class _AnalyticsPageState extends State<AnalyticsPage> {
       });
       
       try {
-        final messages = await _analyticsService.getAllMessagesForSession(session.username);
-        if (messages.isEmpty) continue;
-
-        final messageCount = messages.length;
-        final sentCount = messages.where((m) => m.isSend == 1).length;
-        final receivedCount = messages.where((m) => m.isSend != 1).length;
+        // 使用SQL直接统计，不加载所有消息
+        final stats = await widget.databaseService.getSessionMessageStats(session.username);
+        final messageCount = stats['total'] as int;
+        if (messageCount == 0) continue;
         
-        final lastMessage = messages.isNotEmpty 
-            ? messages.reduce((a, b) => a.createTime > b.createTime ? a : b)
-            : null;
+        final sentCount = stats['sent'] as int;
+        final receivedCount = stats['received'] as int;
         
-        final lastMessageTime = lastMessage != null
-            ? DateTime.fromMillisecondsSinceEpoch(lastMessage.createTime * 1000)
+        // 获取最后一条消息时间
+        final timeRange = await widget.databaseService.getSessionTimeRange(session.username);
+        final lastMessageTime = timeRange['last'] != null
+            ? DateTime.fromMillisecondsSinceEpoch(timeRange['last']! * 1000)
             : null;
 
         rankings.add(ContactRanking(

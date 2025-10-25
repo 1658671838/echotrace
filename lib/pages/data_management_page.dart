@@ -8,6 +8,8 @@ import '../services/config_service.dart';
 import '../services/decrypt_service.dart';
 import '../services/image_decrypt_service.dart';
 import '../services/logger_service.dart';
+import '../services/go_decrypt_ffi.dart';
+import 'log_viewer_page.dart';
 
 /// 数据管理页面
 class DataManagementPage extends StatefulWidget {
@@ -105,6 +107,9 @@ class _DataManagementPageState extends State<DataManagementPage> with SingleTick
       // 按文件大小排序，小的在前
       _databaseFiles.sort((a, b) => a.fileSize.compareTo(b.fileSize));
       
+      // 清理上次更新时重命名的旧文件（.old.* 后缀）
+      await _cleanupOldRenamedFiles(documentsPath);
+      
     } catch (e, stackTrace) {
       await logger.error('DataManagementPage', '加载数据库文件失败', e, stackTrace);
       _showMessage('加载数据库文件失败: $e', false);
@@ -114,6 +119,54 @@ class _DataManagementPageState extends State<DataManagementPage> with SingleTick
           _isLoading = false;
         });
       }
+    }
+  }
+
+  /// 清理上次增量更新时重命名的旧文件
+  Future<void> _cleanupOldRenamedFiles(String documentsPath) async {
+    try {
+      await logger.info('DataManagementPage', '开始清理重命名的旧文件（.old.* 后缀）');
+      int cleanedCount = 0;
+      
+      // 扫描 EchoTrace 目录下所有的 wxid 文件夹
+      final echoTraceDir = Directory('$documentsPath${Platform.pathSeparator}EchoTrace');
+      if (!await echoTraceDir.exists()) {
+        await logger.info('DataManagementPage', 'EchoTrace 目录不存在，跳过清理');
+        return;
+      }
+      
+      await for (final wxidEntity in echoTraceDir.list()) {
+        if (wxidEntity is! Directory) continue;
+        
+        final wxidDirName = wxidEntity.path.split(Platform.pathSeparator).last;
+        if (!wxidDirName.startsWith('wxid_')) continue;
+        
+        // 扫描该 wxid 目录下的所有 .old.* 文件
+        await for (final fileEntity in wxidEntity.list()) {
+          if (fileEntity is! File) continue;
+          
+          final fileName = fileEntity.path.split(Platform.pathSeparator).last;
+          if (fileName.contains('.old.')) {
+            try {
+              await fileEntity.delete();
+              cleanedCount++;
+              await logger.info('DataManagementPage', '已删除旧文件: $fileName');
+            } catch (e) {
+              await logger.warning('DataManagementPage', '无法删除旧文件 $fileName: $e');
+              // 如果文件仍被占用，下次启动时再试
+            }
+          }
+        }
+      }
+      
+      if (cleanedCount > 0) {
+        await logger.info('DataManagementPage', '清理完成，共删除 $cleanedCount 个旧文件');
+      } else {
+        await logger.info('DataManagementPage', '没有需要清理的旧文件');
+      }
+    } catch (e, stackTrace) {
+      await logger.error('DataManagementPage', '清理旧文件失败', e, stackTrace);
+      // 清理失败不影响主流程，继续运行
     }
   }
 
@@ -262,19 +315,21 @@ class _DataManagementPageState extends State<DataManagementPage> with SingleTick
       }
 
       
-      // 先导航到当前页面，确保聊天页面不再使用数据库
+      // 步骤1：强制清理所有页面状态
       if (mounted) {
         context.read<AppState>().setCurrentPage('data_management');
-        await Future.delayed(const Duration(milliseconds: 500));
+        await Future.delayed(const Duration(milliseconds: 1000));
       }
       
-      // 关闭数据库连接，避免文件占用
+      // 步骤2：多次关闭数据库连接
       if (mounted) {
+        await context.read<AppState>().databaseService.close();
+        await Future.delayed(const Duration(milliseconds: 1000));
         await context.read<AppState>().databaseService.close();
       }
       
-      // Windows 需要更长时间释放文件句柄，等待 2500ms
-      await Future.delayed(const Duration(milliseconds: 2500));
+      // 步骤3：等待文件句柄释放
+      await Future.delayed(const Duration(milliseconds: 5000));
       
 
       // -- 开始并行解密--
@@ -308,6 +363,12 @@ class _DataManagementPageState extends State<DataManagementPage> with SingleTick
               }
             },
           );
+          
+          // 验证临时文件
+          final tempFile = File(decryptedPath);
+          if (!await tempFile.exists()) {
+            throw Exception('临时解密文件不存在: $decryptedPath');
+          }
 
           // -- 解密成功后的文件操作 --
           final targetFile = File(file.decryptedPath);
@@ -317,16 +378,51 @@ class _DataManagementPageState extends State<DataManagementPage> with SingleTick
           }
 
           if (await targetFile.exists()) {
+            bool deleteSucceeded = false;
             for (int i = 0; i < 10; i++) {
               try {
                 await targetFile.delete();
+                deleteSucceeded = true;
                 break;
               } catch (e) {
                 if (i < 9) {
                   final delayMs = 300 * (i + 1);
                   await Future.delayed(Duration(milliseconds: delayMs));
                 } else {
-                  rethrow;
+                  // 删除失败，不抛出异常，而是尝试重命名
+                }
+              }
+            }
+            
+            // 如果删除失败，尝试强制解锁文件
+            if (!deleteSucceeded && await targetFile.exists()) {
+              try {
+                // 使用 Windows Restart Manager API 强制关闭文件句柄
+                final goFfi = GoDecryptFFI();
+                final unlockError = goFfi.forceUnlockFile(file.decryptedPath);
+                
+                if (unlockError == null) {
+                  await Future.delayed(const Duration(milliseconds: 500));
+                  
+                  // 再次尝试删除
+                  try {
+                    await targetFile.delete();
+                    deleteSucceeded = true;
+                  } catch (e) {
+                    // 解锁后仍然失败
+                  }
+                }
+              } catch (e) {
+                // 强制解锁失败
+              }
+              
+              // 如果解锁后仍然无法删除，尝试重命名旧文件
+              if (!deleteSucceeded && await targetFile.exists()) {
+                final oldPath = '${file.decryptedPath}.old.${DateTime.now().millisecondsSinceEpoch}';
+                try {
+                  await targetFile.rename(oldPath);
+                } catch (e) {
+                  // 即使重命名失败，也尝试复制新文件
                 }
               }
             }
@@ -347,6 +443,7 @@ class _DataManagementPageState extends State<DataManagementPage> with SingleTick
             });
           }
           
+          // 清理临时文件
           Future.delayed(const Duration(milliseconds: 100), () async {
             try {
               await File(decryptedPath).delete();
@@ -354,7 +451,9 @@ class _DataManagementPageState extends State<DataManagementPage> with SingleTick
           });
 
           return true; // 成功
-        } catch (e) {
+        } catch (e, stackTrace) {
+          // 只在出错时记录日志
+          await logger.error('DataManagementPage', '解密文件 ${file.fileName} 失败', e, stackTrace);
           _lastProgressUpdateMap.remove(file.originalPath);
           _decryptResults[file.fileName] = false;
           return false; // 失败
@@ -369,8 +468,9 @@ class _DataManagementPageState extends State<DataManagementPage> with SingleTick
       final failCount = _decryptResults.values.where((v) => !v).length;
 
       // 等待文件系统完全释放文件句柄并刷新缓存（Windows需要更长时间）
-      await logger.info('DataManagementPage', '等待文件系统稳定...');
-      await Future.delayed(const Duration(milliseconds: 2500));
+      //  修复：增加等待时间到5秒，确保数据库文件完全写入磁盘
+      await logger.info('DataManagementPage', '等待文件系统稳定（5秒）...');
+      await Future.delayed(const Duration(milliseconds: 5000));
 
       // 重新连接数据库（增加重试次数和延迟）
       if (mounted) {
@@ -433,6 +533,37 @@ class _DataManagementPageState extends State<DataManagementPage> with SingleTick
       return;
     }
     
+    // 警告用户确保没有后台任务
+    if (mounted) {
+      final shouldContinue = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('准备增量更新'),
+          content: const Text(
+            '增量更新需要独占访问数据库文件。\n\n'
+            '请确保：\n'
+            '1. 没有正在进行的数据分析任务\n'
+            '2. 没有打开年度报告页面\n'
+            '3. 其他页面已停止使用数据库\n\n'
+            '更新过程将等待约10秒以确保文件释放。\n'
+            '是否继续？'
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('取消'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('继续更新'),
+            ),
+          ],
+        ),
+      );
+      
+      if (shouldContinue != true) return;
+    }
+    
     if (!mounted) return;
     setState(() {
       _isDecrypting = true;
@@ -448,20 +579,32 @@ class _DataManagementPageState extends State<DataManagementPage> with SingleTick
         return;
       }
       
-      // 先导航到当前页面，确保聊天页面不再使用数据库
+      // 步骤1：强制清理所有页面状态，确保没有页面在使用数据库
       if (mounted) {
+        await logger.info('DataManagementPage', '步骤1: 导航到数据管理页面并清理其他页面');
         context.read<AppState>().setCurrentPage('data_management');
-        await Future.delayed(const Duration(milliseconds: 500));
+        // 通知所有页面停止数据库操作
+        await Future.delayed(const Duration(milliseconds: 1000));
       }
       
-      // 关闭数据库连接，避免文件占用
+      // 步骤2：多次尝试关闭数据库连接，确保所有连接都被释放
       if (mounted) {
+        await logger.info('DataManagementPage', '步骤2: 第1次关闭数据库连接（包括缓存）');
         await context.read<AppState>().databaseService.close();
+        await Future.delayed(const Duration(milliseconds: 1000));
+        
+        // 第二次关闭，确保清理
+        await logger.info('DataManagementPage', '步骤2: 第2次关闭数据库连接（确保清理）');
+        await context.read<AppState>().databaseService.close();
+        await logger.info('DataManagementPage', '所有数据库连接已关闭');
       }
       
-      // Windows 需要更长时间释放文件句柄，等待 2500ms
-      await Future.delayed(const Duration(milliseconds: 2500));
-      
+      // 步骤3：等待足够长的时间让操作系统释放所有文件句柄
+      // Windows 系统需要更长时间，特别是有多个进程/Isolate时
+      await logger.info('DataManagementPage', '步骤3: 等待文件句柄完全释放（5秒）...');
+      await logger.warning('DataManagementPage', '如果有后台分析任务正在运行，文件可能仍被占用');
+      await Future.delayed(const Duration(milliseconds: 5000));
+      await logger.info('DataManagementPage', '文件句柄释放完成，开始增量更新');
 
       // -- 开始串行更新 --
       for (final file in filesToUpdate) {
@@ -484,23 +627,83 @@ class _DataManagementPageState extends State<DataManagementPage> with SingleTick
           });
 
           // -- 更新成功后的文件操作 --
+          await logger.info('DataManagementPage', '准备替换文件: ${file.fileName}');
           final targetFile = File(file.decryptedPath);
+          
           if (await targetFile.exists()) {
+            await logger.info('DataManagementPage', '目标文件已存在，尝试删除: ${file.decryptedPath}');
+            bool deleteSucceeded = false;
+            
+            // 尝试删除10次
             for (int i = 0; i < 10; i++) {
               try {
                 await targetFile.delete();
+                await logger.info('DataManagementPage', '目标文件删除成功');
+                deleteSucceeded = true;
                 break;
               } catch (e) {
                 if (i < 9) {
                   final delayMs = 300 * (i + 1);
+                  await logger.warning('DataManagementPage', '删除失败（尝试${i+1}/10），等待${delayMs}ms后重试: $e');
                   await Future.delayed(Duration(milliseconds: delayMs));
                 } else {
-                  rethrow;
+                  await logger.error('DataManagementPage', '删除目标文件失败，已重试10次，尝试重命名方案', e);
+                }
+              }
+            }
+            
+            // 如果删除失败，尝试强制解锁文件
+            if (!deleteSucceeded && await targetFile.exists()) {
+              await logger.warning('DataManagementPage', '无法删除文件（可能被其他进程占用），尝试强制解锁');
+              
+              try {
+                // 使用 Windows Restart Manager API 强制关闭文件句柄
+                final goFfi = GoDecryptFFI();
+                final unlockError = goFfi.forceUnlockFile(file.decryptedPath);
+                
+                if (unlockError == null) {
+                  await logger.info('DataManagementPage', '文件解锁成功，等待500ms后重试删除');
+                  await Future.delayed(const Duration(milliseconds: 500));
+                  
+                  // 再次尝试删除
+                  try {
+                    await targetFile.delete();
+                    deleteSucceeded = true;
+                    await logger.info('DataManagementPage', '解锁后删除成功');
+                  } catch (e) {
+                    await logger.warning('DataManagementPage', '解锁后删除仍然失败: $e');
+                  }
+                } else {
+                  await logger.warning('DataManagementPage', '文件解锁失败: $unlockError');
+                }
+              } catch (e) {
+                await logger.error('DataManagementPage', '强制解锁过程出错', e);
+              }
+              
+              // 如果解锁后仍然无法删除，尝试重命名旧文件
+              if (!deleteSucceeded && await targetFile.exists()) {
+                await logger.warning('DataManagementPage', '强制解锁后仍无法删除，尝试重命名旧文件');
+                final oldPath = '${file.decryptedPath}.old.${DateTime.now().millisecondsSinceEpoch}';
+                
+                try {
+                  await targetFile.rename(oldPath);
+                  await logger.info('DataManagementPage', '旧文件已重命名为: $oldPath（将在下次启动时清理）');
+                } catch (e) {
+                  await logger.error('DataManagementPage', '重命名旧文件也失败，可能文件被严格锁定', e);
+                  // 即使重命名失败，也尝试复制新文件（可能会覆盖）
                 }
               }
             }
           }
-          await File(decryptedPath).copy(file.decryptedPath);
+          
+          await logger.info('DataManagementPage', '复制新文件: $decryptedPath -> ${file.decryptedPath}');
+          try {
+            await File(decryptedPath).copy(file.decryptedPath);
+            await logger.info('DataManagementPage', '文件复制成功: ${file.fileName}');
+          } catch (e) {
+            await logger.error('DataManagementPage', '文件复制失败: ${file.fileName}', e);
+            rethrow;
+          }
           
           final newStat = await File(file.decryptedPath).stat();
           _lastProgressUpdateMap.remove(file.originalPath);
@@ -636,6 +839,12 @@ class _DataManagementPageState extends State<DataManagementPage> with SingleTick
           });
         }
       });
+      
+      // 验证临时文件
+      final tempFile = File(decryptedPath);
+      if (!await tempFile.exists()) {
+        throw Exception('临时解密文件不存在: $decryptedPath');
+      }
 
       // 确保目标目录存在
       final targetFile = File(file.decryptedPath);
@@ -914,7 +1123,7 @@ class _DataManagementPageState extends State<DataManagementPage> with SingleTick
     return 'original';
   }
 
-  /// 扫描单个wxid目录下的图片（优化版：快速扫描，延迟检查解密状态）
+  /// 扫描单个wxid目录下的图片
   Future<void> _scanWxidImageDirectory(Directory wxidDir, String documentsPath) async {
     int foundCount = 0;
     int updateThreshold = 0; // 每100个文件更新一次UI
@@ -1244,6 +1453,22 @@ class _DataManagementPageState extends State<DataManagementPage> with SingleTick
           ),
           child: Row(
             children: [
+              // 查看日志按钮
+              OutlinedButton.icon(
+                onPressed: () {
+                  Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (context) => const LogViewerPage(),
+                    ),
+                  );
+                },
+                icon: const Icon(Icons.article_outlined),
+                label: const Text('查看日志'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.grey.shade700,
+                  side: BorderSide(color: Colors.grey.shade300),
+                ),
+              ),
               const Spacer(),
               // 增量更新按钮
               if (_databaseFiles.any((file) => file.needsUpdate))

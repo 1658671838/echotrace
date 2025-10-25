@@ -130,8 +130,21 @@ class AppState extends ChangeNotifier {
 
     Exception? lastError;
     
+    // 🔧 修复：强制关闭所有数据库连接，释放文件句柄
+    try {
+      await logger.info('AppState', '关闭旧的数据库连接...');
+      await databaseService.close();
+      // 等待更长时间，确保Windows系统完全释放文件句柄
+      await Future.delayed(Duration(milliseconds: retryDelay * 2));
+      await logger.info('AppState', '数据库连接已关闭');
+    } catch (e) {
+      await logger.warning('AppState', '关闭数据库连接时出现警告（可忽略）', e);
+    }
+    
     for (int attempt = 0; attempt < retryCount; attempt++) {
       try {
+        await logger.info('AppState', '尝试重新连接数据库 (第${attempt + 1}/${retryCount}次)');
+        
         // 获取配置的数据库模式
         final mode = await configService.getDatabaseMode();
 
@@ -139,6 +152,7 @@ class AppState extends ChangeNotifier {
           try {
             await _tryConnectRealtimeDatabase();
           } catch (e) {
+            await logger.warning('AppState', '实时模式连接失败，回退到备份模式', e);
             // 实时模式失败，回退到备份模式
             await _tryConnectDecryptedDatabase();
           }
@@ -148,6 +162,7 @@ class AppState extends ChangeNotifier {
         
         // 验证连接是否成功
         if (databaseService.isConnected) {
+          await logger.info('AppState', '数据库重新连接成功');
           _errorMessage = null;
           _isLoading = false;
           notifyListeners();
@@ -157,9 +172,11 @@ class AppState extends ChangeNotifier {
         }
       } catch (e) {
         lastError = e is Exception ? e : Exception(e.toString());
+        await logger.error('AppState', '重连数据库失败(第${attempt + 1}次)', e);
         
         if (attempt < retryCount - 1) {
           // 还有重试机会，等待后重试
+          await logger.info('AppState', '等待${retryDelay}ms后重试...');
           await Future.delayed(Duration(milliseconds: retryDelay));
         }
       }
@@ -167,6 +184,7 @@ class AppState extends ChangeNotifier {
     
     // 所有重试都失败
     _errorMessage = '数据库连接失败（已重试${retryCount}次）: ${lastError?.toString() ?? "未知错误"}';
+    await logger.error('AppState', _errorMessage!);
     _isLoading = false;
     notifyListeners();
   }
@@ -181,12 +199,16 @@ class AppState extends ChangeNotifier {
         await logger.error('AppState', '未配置解密密钥');
         throw Exception('未配置解密密钥，请在设置中配置密钥');
       }
+      
+      await logger.info('AppState', '已获取解密密钥（长度: ${hexKey.length}）');
 
       final dbPath = await configService.getDatabasePath();
       if (dbPath == null) {
         await logger.error('AppState', '未配置数据库路径');
         throw Exception('未配置数据库路径，请在设置中选择数据库目录');
       }
+      
+      await logger.info('AppState', '配置的数据库路径: $dbPath');
 
       // 自动定位 session.db
       final sessionDbPath = await _locateSessionDb(dbPath);
@@ -198,7 +220,7 @@ class AppState extends ChangeNotifier {
       await logger.info('AppState', '找到session.db: $sessionDbPath');
       // 连接实时加密数据库
       await databaseService.connectRealtimeDatabase(sessionDbPath, hexKey);
-      await logger.info('AppState', '实时数据库连接成功');
+      await logger.info('AppState', '实时数据库连接成功，isConnected=${databaseService.isConnected}');
     } catch (e, stackTrace) {
       await logger.error('AppState', '连接实时数据库失败', e, stackTrace);
       rethrow;
@@ -309,19 +331,24 @@ class AppState extends ChangeNotifier {
           // 优先尝试 session.db
           if (fileName.contains('session')) {
             attemptedFiles.add(dbFile.path);
+            await logger.info('AppState', '尝试连接数据库: ${dbFile.path}');
             try {
               await databaseService.connectDecryptedDatabase(dbFile.path);
               final tables = await databaseService.getAllTableNames();
               
+              await logger.info('AppState', '数据库 $fileName 包含的表: ${tables.join(", ")}');
+              
               // 检查是否包含 SessionTable
               if (tables.contains('SessionTable')) {
-                await logger.info('AppState', '成功连接数据库: $fileName');
+                await logger.info('AppState', '成功连接数据库: $fileName，isConnected=${databaseService.isConnected}');
                 return; // 成功找到并连接
+              } else {
+                await logger.warning('AppState', '数据库 $fileName 不包含SessionTable');
               }
-            } catch (e) {
+            } catch (e, stackTrace) {
               final errorMsg = '连接 $fileName 失败: $e';
               errors.add(errorMsg);
-              await logger.warning('AppState', errorMsg, e);
+              await logger.error('AppState', errorMsg, e, stackTrace);
             }
           }
         }

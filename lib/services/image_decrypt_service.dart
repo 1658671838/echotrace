@@ -20,7 +20,7 @@ class ImageDecryptService {
     return result;
   }
 
-  /// 解密微信 V4 版本的 .dat 文件（修复版，对比Python实现）
+  /// 解密微信 V4 版本的 .dat 文件
   /// [inputPath] 输入文件路径
   /// [xorKey] XOR 密钥
   /// [aesKey] AES 密钥（16字节）
@@ -59,7 +59,7 @@ class ImageDecryptService {
     // 去除PKCS7填充
     final unpaddedData = _removePadding(decryptedData);
 
-    // 处理XOR数据（参考Python实现）
+    // 处理XOR数据
     Uint8List rawData;
     Uint8List xoredData;
 
@@ -201,7 +201,7 @@ class ImageDecryptService {
   }
 
   /// 将字符串转换为AES密钥（16字节）
-  /// 参考Python实现：y.encode()[:16]
+  /// y.encode()[:16]
   /// 将字符串的每个字符作为ASCII字节，取前16字节
   /// 例如："b18052363165af7e" -> [98, 49, 56, 48, 53, 50, 51, 54, 51, 49, 54, 53, 97, 102, 55, 101]
   static Uint8List hexToBytes16(String keyString) {
@@ -216,7 +216,7 @@ class ImageDecryptService {
       throw Exception('AES密钥至少需要16个字符');
     }
     
-    // 直接将字符串的每个字符转为ASCII字节（与Python的.encode()一致）
+    // 直接将字符串的每个字符转为ASCII字节
     final stringBytes = cleanKey.codeUnits;
     final bytes = Uint8List(16);
     

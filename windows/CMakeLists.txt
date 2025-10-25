@@ -93,6 +93,17 @@ if(PLUGIN_BUNDLED_LIBRARIES)
     COMPONENT Runtime)
 endif()
 
+# Copy Go decrypt library
+set(GO_DECRYPT_DLL "${CMAKE_CURRENT_SOURCE_DIR}/runner/go_decrypt.dll")
+if(EXISTS "${GO_DECRYPT_DLL}")
+  install(FILES "${GO_DECRYPT_DLL}"
+    DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+    COMPONENT Runtime)
+  message(STATUS "Go decrypt DLL will be installed: ${GO_DECRYPT_DLL}")
+else()
+  message(WARNING "Go decrypt DLL not found: ${GO_DECRYPT_DLL}")
+endif()
+
 # Copy the native assets provided by the build.dart from all packages.
 set(NATIVE_ASSETS_DIR "${PROJECT_BUILD_DIR}native_assets/windows/")
 install(DIRECTORY "${NATIVE_ASSETS_DIR}"

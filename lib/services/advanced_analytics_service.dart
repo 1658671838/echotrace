@@ -62,40 +62,16 @@ class AdvancedAnalyticsService {
 
   /// 分析作息规律（24小时×7天热力图）
   Future<ActivityHeatmap> analyzeActivityPattern() async {
-    final sessions = await _databaseService.getSessions();
-    final privateSessions = sessions
-        .where((s) => !s.isGroup && !_isSystemAccount(s.username))
-        .toList();
+    // 使用SQL直接统计，避免加载所有消息到内存
+    final data = await _databaseService.getActivityHeatmapData(year: _filterYear);
 
-    // 初始化数据结构
-    final data = <int, Map<int, int>>{};
-    for (int hour = 0; hour < 24; hour++) {
-      data[hour] = {};
-      for (int weekday = 1; weekday <= 7; weekday++) {
-        data[hour]![weekday] = 0;
-      }
-    }
-
+    // 计算最大值
     int maxCount = 0;
-
-    // 统计每个时段的消息数
-    for (final session in privateSessions) {
-      try {
-        final allMessages = await _analyticsService.getAllMessagesForSession(session.username);
-        final messages = _filterMessagesByYear(allMessages);
-        
-        for (final msg in messages) {
-          final time = DateTime.fromMillisecondsSinceEpoch(msg.createTime * 1000);
-          final hour = time.hour;
-          final weekday = time.weekday;
-          
-          data[hour]![weekday] = (data[hour]![weekday] ?? 0) + 1;
-          if (data[hour]![weekday]! > maxCount) {
-            maxCount = data[hour]![weekday]!;
-          }
+    for (final hourData in data.values) {
+      for (final count in hourData.values) {
+        if (count > maxCount) {
+          maxCount = count;
         }
-      } catch (e) {
-        // 遇到错误时跳过这个会话，继续处理下一个
       }
     }
 
@@ -505,7 +481,6 @@ class AdvancedAnalyticsService {
     );
 
     int totalMessages = 0;
-    // 性能优化：使用SQL直接统计，避免加载所有消息
     for (final session in privateSessions) {
       try {
         final stats = await _databaseService.getSessionMessageStats(
@@ -563,7 +538,6 @@ class AdvancedAnalyticsService {
     );
 
     int totalSent = 0;
-    // 性能优化：使用SQL直接统计
     for (final session in privateSessions) {
       try {
         final stats = await _databaseService.getSessionMessageStats(
@@ -613,7 +587,6 @@ class AdvancedAnalyticsService {
     );
 
     int totalReceived = 0;
-    // 性能优化：使用SQL直接统计
     for (final session in privateSessions) {
       try {
         final stats = await _databaseService.getSessionMessageStats(
@@ -666,7 +639,6 @@ class AdvancedAnalyticsService {
 
     for (final session in privateSessions) {
       try {
-        // 性能优化：使用SQL直接统计，不加载所有消息
         final stats = await _databaseService.getSessionMessageStats(
           session.username,
           filterYear: _filterYear,
@@ -732,7 +704,6 @@ class AdvancedAnalyticsService {
 
     for (final session in privateSessions) {
       try {
-        // 性能优化：使用SQL直接按日期分组统计
         final messagesByDate = await _databaseService.getSessionMessagesByDate(
           session.username,
           filterYear: _filterYear,
@@ -807,7 +778,6 @@ class AdvancedAnalyticsService {
 
     for (final session in privateSessions) {
       try {
-        // 性能优化：使用SQL直接按日期分组统计
         final sessionMessagesByDate = await _databaseService.getSessionMessagesByDate(
           session.username,
           filterYear: _filterYear,
@@ -894,7 +864,6 @@ class AdvancedAnalyticsService {
 
     for (final session in privateSessions) {
       try {
-        // 性能优化：直接获取日期列表，不加载完整消息
         final messageDates = await _databaseService.getSessionMessageDates(
           session.username,
           filterYear: _filterYear,
@@ -955,7 +924,6 @@ class AdvancedAnalyticsService {
 
   /// 消息类型分布
   Future<List<MessageTypeStats>> analyzeMessageTypeDistribution() async {
-    // 性能优化：使用SQL直接统计所有消息类型
     final typeCount = await _databaseService.getAllMessageTypeDistribution(
       filterYear: _filterYear,
     );
@@ -1020,54 +988,30 @@ class AdvancedAnalyticsService {
 
   /// 消息长度分析
   Future<MessageLengthData> analyzeMessageLength() async {
-    final sessions = await _databaseService.getSessions();
-    final privateSessions = sessions
-        .where((s) => !s.isGroup && !_isSystemAccount(s.username))
-        .toList();
+    final stats = await _databaseService.getTextMessageLengthStats(year: _filterYear);
+    
+    final averageLength = stats['averageLength'] as double;
+    final longestLength = stats['longestLength'] as int;
+    final textMessageCount = stats['textMessageCount'] as int;
+    final longestMsg = stats['longestMessage'] as Map<String, dynamic>?;
 
-    final displayNames = await _databaseService.getDisplayNames(
-      privateSessions.map((s) => s.username).toList(),
-    );
-
-    int totalLength = 0;
-    int textMessageCount = 0;
-    int longestLength = 0;
     String longestContent = '';
     String? longestSentTo;
     String? longestSentToDisplayName;
     DateTime? longestMessageTime;
 
-    for (final session in privateSessions) {
-      try {
-        final allMessages = await _analyticsService.getAllMessagesForSession(session.username);
-        final messages = _filterMessagesByYear(allMessages);
-
-        for (final msg in messages) {
-          // 只统计自己发送的文本消息
-          if (msg.isSend == 1 && msg.isTextMessage) {
-            final content = msg.displayContent;
-            if (content.isNotEmpty && !content.startsWith('[')) {
-              totalLength += content.length;
-              textMessageCount++;
-
-              if (content.length > longestLength) {
-                longestLength = content.length;
-                longestContent = content.length > 100 
-                    ? content.substring(0, 100) + '...' 
-                    : content;
-                longestSentTo = session.username;
-                longestSentToDisplayName = displayNames[session.username] ?? session.username;
-                longestMessageTime = DateTime.fromMillisecondsSinceEpoch(msg.createTime * 1000);
-              }
-            }
-          }
-        }
-      } catch (e) {
-        // 跳过错误
-      }
+    if (longestMsg != null) {
+      final content = longestMsg['content'] as String;
+      longestContent = content.length > 100 
+          ? content.substring(0, 100) + '...' 
+          : content;
+      longestMessageTime = DateTime.fromMillisecondsSinceEpoch((longestMsg['createTime'] as int) * 1000);
+      
+      // 从表名推断会话ID（简化处理，实际可能需要反查）
+      final tableName = longestMsg['tableName'] as String;
+      longestSentTo = tableName; // 临时使用表名
+      longestSentToDisplayName = tableName; // 临时使用表名
     }
-
-    final averageLength = textMessageCount > 0 ? totalLength / textMessageCount : 0.0;
 
     return MessageLengthData(
       averageLength: averageLength,

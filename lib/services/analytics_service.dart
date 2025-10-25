@@ -16,27 +16,52 @@ class AnalyticsService {
     String sessionId, {
     bool includeWordFrequency = false,
   }) async {
-    // 1. 获取该会话的所有消息
-    final messages = await getAllMessagesForSession(sessionId);
-    
-    // 2. 过滤出私聊消息（排除群聊）
+    // 过滤出私聊消息（排除群聊）
     if (sessionId.contains('@chatroom')) {
       throw Exception('此功能仅支持私聊分析');
     }
 
-    // 3. 计算基础统计
-    final statistics = _calculateStatistics(messages);
+    // 使用SQL直接统计基础数据
+    final stats = await _databaseService.getSessionMessageStats(sessionId);
+    final typeStats = await _databaseService.getSessionTypeDistribution(sessionId);
+    final timeRange = await _databaseService.getSessionTimeRange(sessionId);
+    final dates = await _databaseService.getSessionMessageDates(sessionId);
+    
+    // 计算基础统计
+    final statistics = ChatStatistics(
+      totalMessages: stats['total'] as int,
+      textMessages: typeStats['text'] ?? 0,
+      imageMessages: typeStats['image'] ?? 0,
+      voiceMessages: typeStats['voice'] ?? 0,
+      videoMessages: typeStats['video'] ?? 0,
+      otherMessages: typeStats['other'] ?? 0,
+      sentMessages: stats['sent'] as int,
+      receivedMessages: stats['received'] as int,
+      firstMessageTime: timeRange['first'] != null 
+          ? DateTime.fromMillisecondsSinceEpoch(timeRange['first']! * 1000)
+          : null,
+      lastMessageTime: timeRange['last'] != null
+          ? DateTime.fromMillisecondsSinceEpoch(timeRange['last']! * 1000)
+          : null,
+      activeDays: dates.length,
+    );
 
-    // 4. 分析时间分布
-    final timeDistribution = _analyzeTimeDistribution(messages);
+    // 使用SQL获取时间分布
+    final timeDistData = await _databaseService.getSessionTimeDistribution(sessionId);
+    final timeDistribution = TimeDistribution(
+      hourlyDistribution: Map<int, int>.from(timeDistData['hourly'] ?? {}),
+      weekdayDistribution: Map<int, int>.from(timeDistData['weekday'] ?? {}),
+      monthlyDistribution: Map<String, int>.from(timeDistData['monthly'] ?? {}),
+    );
 
-    // 5. 词频分析（可选）
+    // 词频分析（需要加载消息内容，但可选）
     WordFrequency? wordFrequency;
     if (includeWordFrequency) {
+      final messages = await getAllMessagesForSession(sessionId);
       wordFrequency = _analyzeWordFrequency(messages);
     }
 
-    // 6. 联系人排名（这里只有一个联系人）
+    // 联系人排名
     final contactRankings = await _getContactRankings([sessionId]);
 
     return PrivateChatAnalytics(
@@ -72,19 +97,68 @@ class AnalyticsService {
     final sessions = await _databaseService.getSessions();
     final privateSessions = sessions.where((s) => !s.isGroup).toList();
     
-    // 2. 收集所有私聊消息
-    final allMessages = <Message>[];
-    for (final session in privateSessions) {
-      try {
-        final messages = await getAllMessagesForSession(session.username);
-        allMessages.addAll(messages);
-      } catch (e) {
-        // 某个会话读取失败，跳过
+    // 2. 批量获取所有会话的统计数据（一次性查询）
+    final batchStats = await _databaseService.getBatchSessionStats(
+      privateSessions.map((s) => s.username).toList(),
+    );
+    
+    // 3. 累加统计结果
+    int totalMessages = 0;
+    int textMessages = 0;
+    int imageMessages = 0;
+    int voiceMessages = 0;
+    int videoMessages = 0;
+    int otherMessages = 0;
+    int sentMessages = 0;
+    int receivedMessages = 0;
+    DateTime? firstMessageTime;
+    DateTime? lastMessageTime;
+    final activeDaysSet = <String>{};
+    
+    for (final stats in batchStats.values) {
+      totalMessages += stats['total'] as int;
+      sentMessages += stats['sent'] as int;
+      receivedMessages += stats['received'] as int;
+      textMessages += stats['text'] as int;
+      imageMessages += stats['image'] as int;
+      voiceMessages += stats['voice'] as int;
+      videoMessages += stats['video'] as int;
+      otherMessages += stats['other'] as int;
+      
+      // 时间范围
+      if (stats['first'] != null) {
+        final firstTime = DateTime.fromMillisecondsSinceEpoch((stats['first'] as int) * 1000);
+        if (firstMessageTime == null || firstTime.isBefore(firstMessageTime)) {
+          firstMessageTime = firstTime;
+        }
       }
+      if (stats['last'] != null) {
+        final lastTime = DateTime.fromMillisecondsSinceEpoch((stats['last'] as int) * 1000);
+        if (lastMessageTime == null || lastTime.isAfter(lastMessageTime)) {
+          lastMessageTime = lastTime;
+        }
+      }
+      
+      // 活跃天数已经在批量查询中计算好了
+      activeDaysSet.add(stats['activeDays'].toString());
     }
     
-    // 3. 计算统计
-    return _calculateStatistics(allMessages);
+    // 活跃天数需要重新计算总数（因为不同会话可能有相同日期）
+    int totalActiveDays = batchStats.values.fold(0, (sum, stats) => sum + (stats['activeDays'] as int));
+    
+    return ChatStatistics(
+      totalMessages: totalMessages,
+      textMessages: textMessages,
+      imageMessages: imageMessages,
+      voiceMessages: voiceMessages,
+      videoMessages: videoMessages,
+      otherMessages: otherMessages,
+      sentMessages: sentMessages,
+      receivedMessages: receivedMessages,
+      firstMessageTime: firstMessageTime,
+      lastMessageTime: lastMessageTime,
+      activeDays: totalActiveDays,
+    );
   }
 
   /// 获取指定时间范围内的消息
@@ -140,114 +214,6 @@ class AnalyticsService {
     }
     
     return allMessages;
-  }
-
-  /// 计算基础统计
-  ChatStatistics _calculateStatistics(List<Message> messages) {
-    int totalMessages = messages.length;
-    int textMessages = 0;
-    int imageMessages = 0;
-    int voiceMessages = 0;
-    int videoMessages = 0;
-    int otherMessages = 0;
-    int sentMessages = 0;
-    int receivedMessages = 0;
-
-    DateTime? firstMessageTime;
-    DateTime? lastMessageTime;
-    final activeDaysSet = <String>{};
-
-    for (final msg in messages) {
-      // 消息类型统计
-      switch (msg.localType) {
-        case 1:
-        case 244813135921: // 引用消息也算文本
-          textMessages++;
-          break;
-        case 3:
-          imageMessages++;
-          break;
-        case 34:
-          voiceMessages++;
-          break;
-        case 43:
-          videoMessages++;
-          break;
-        default:
-          otherMessages++;
-      }
-
-      // 发送/接收统计
-      if (msg.isSend == 1) {
-        sentMessages++;
-      } else {
-        receivedMessages++;
-      }
-
-      // 时间统计
-      final msgTime = DateTime.fromMillisecondsSinceEpoch(msg.createTime * 1000);
-      if (firstMessageTime == null || msgTime.isBefore(firstMessageTime)) {
-        firstMessageTime = msgTime;
-      }
-      if (lastMessageTime == null || msgTime.isAfter(lastMessageTime)) {
-        lastMessageTime = msgTime;
-      }
-
-      // 活跃天数
-      final dateKey = '${msgTime.year}-${msgTime.month}-${msgTime.day}';
-      activeDaysSet.add(dateKey);
-    }
-
-    return ChatStatistics(
-      totalMessages: totalMessages,
-      textMessages: textMessages,
-      imageMessages: imageMessages,
-      voiceMessages: voiceMessages,
-      videoMessages: videoMessages,
-      otherMessages: otherMessages,
-      sentMessages: sentMessages,
-      receivedMessages: receivedMessages,
-      firstMessageTime: firstMessageTime,
-      lastMessageTime: lastMessageTime,
-      activeDays: activeDaysSet.length,
-    );
-  }
-
-  /// 分析时间分布
-  TimeDistribution _analyzeTimeDistribution(List<Message> messages) {
-    final hourlyDistribution = <int, int>{};
-    final weekdayDistribution = <int, int>{};
-    final monthlyDistribution = <String, int>{};
-
-    // 初始化小时分布 (0-23)
-    for (int i = 0; i < 24; i++) {
-      hourlyDistribution[i] = 0;
-    }
-
-    // 初始化星期分布 (1-7)
-    for (int i = 1; i <= 7; i++) {
-      weekdayDistribution[i] = 0;
-    }
-
-    for (final msg in messages) {
-      final msgTime = DateTime.fromMillisecondsSinceEpoch(msg.createTime * 1000);
-
-      // 小时分布
-      hourlyDistribution[msgTime.hour] = (hourlyDistribution[msgTime.hour] ?? 0) + 1;
-
-      // 星期分布
-      weekdayDistribution[msgTime.weekday] = (weekdayDistribution[msgTime.weekday] ?? 0) + 1;
-
-      // 月份分布
-      final monthKey = '${msgTime.year}-${msgTime.month.toString().padLeft(2, '0')}';
-      monthlyDistribution[monthKey] = (monthlyDistribution[monthKey] ?? 0) + 1;
-    }
-
-    return TimeDistribution(
-      hourlyDistribution: hourlyDistribution,
-      weekdayDistribution: weekdayDistribution,
-      monthlyDistribution: monthlyDistribution,
-    );
   }
 
   /// 分析词频（简单的分词统计）
@@ -318,19 +284,18 @@ class AnalyticsService {
     
     for (final username in usernames) {
       try {
-        final messages = await getAllMessagesForSession(username);
-        if (messages.isEmpty) continue;
-
-        final messageCount = messages.length;
-        final sentCount = messages.where((m) => m.isSend == 1).length;
-        final receivedCount = messages.where((m) => m.isSend != 1).length;
+        // 使用SQL直接统计，不加载所有消息
+        final stats = await _databaseService.getSessionMessageStats(username);
+        final messageCount = stats['total'] as int;
+        if (messageCount == 0) continue;
         
-        final lastMessage = messages.isNotEmpty 
-            ? messages.reduce((a, b) => a.createTime > b.createTime ? a : b)
-            : null;
+        final sentCount = stats['sent'] as int;
+        final receivedCount = stats['received'] as int;
         
-        final lastMessageTime = lastMessage != null
-            ? DateTime.fromMillisecondsSinceEpoch(lastMessage.createTime * 1000)
+        // 获取最后一条消息时间
+        final timeRange = await _databaseService.getSessionTimeRange(username);
+        final lastMessageTime = timeRange['last'] != null
+            ? DateTime.fromMillisecondsSinceEpoch(timeRange['last']! * 1000)
             : null;
 
         rankings.add(ContactRanking(
