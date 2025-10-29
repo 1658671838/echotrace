@@ -9,6 +9,7 @@ import '../models/contact.dart';
 import '../models/chat_session.dart';
 import 'wechat_vfs_native.dart';
 import 'logger_service.dart';
+import '../utils/path_utils.dart';
 
 /// 数据库读取模式
 enum DatabaseMode {
@@ -57,10 +58,16 @@ class DatabaseService {
   /// [factory] 可选的数据库工厂，用于 Isolate 中避免全局修改
   Future<void> connectDecryptedDatabase(String dbPath, {DatabaseFactory? factory}) async {
     try {
-      await logger.info('DatabaseService', '尝试连接解密后的数据库: $dbPath');
-      
-      if (!File(dbPath).existsSync()) {
-        await logger.error('DatabaseService', '数据库文件不存在: $dbPath');
+      // 规范化路径，支持中文和空格
+      final normalizedPath = PathUtils.normalizeDatabasePath(dbPath);
+      await logger.info('DatabaseService', '尝试连接解密后的数据库: ${PathUtils.escapeForLog(normalizedPath)}');
+
+      if (PathUtils.hasSpecialCharacters(normalizedPath)) {
+        await logger.warning('DatabaseService', '路径包含特殊字符（中文/空格），已规范化处理');
+      }
+
+      if (!File(normalizedPath).existsSync()) {
+        await logger.error('DatabaseService', '数据库文件不存在: ${PathUtils.escapeForLog(normalizedPath)}');
         throw Exception('解密后的数据库文件不存在');
       }
 
@@ -77,10 +84,10 @@ class DatabaseService {
 
       // 使用指定的工厂或已保存的工厂或默认工厂
       final dbFactory = factory ?? _dbFactory ?? databaseFactory;
-      
+
       // 以只读模式打开数据库，不指定 version 避免写入操作
       _sessionDb = await dbFactory.openDatabase(
-        dbPath,
+        normalizedPath,
         options: OpenDatabaseOptions(
           readOnly: true,
           singleInstance: false, // 允许多个实例，避免冲突
@@ -88,9 +95,9 @@ class DatabaseService {
       );
 
       _mode = DatabaseMode.decrypted;
-      _sessionDbPath = dbPath;
-      _currentAccountWxid = _extractWxidFromPath(dbPath);
-      
+      _sessionDbPath = normalizedPath;
+      _currentAccountWxid = _extractWxidFromPath(normalizedPath);
+
       await logger.info('DatabaseService', '成功连接解密数据库，模式: ${_mode.name}, 当前账号wxid: $_currentAccountWxid');
     } catch (e, stackTrace) {
       await logger.error('DatabaseService', '连接解密数据库失败', e, stackTrace);
@@ -104,10 +111,16 @@ class DatabaseService {
   /// [factory] 可选的数据库工厂
   Future<void> connectRealtimeDatabase(String dbPath, String hexKey, {DatabaseFactory? factory}) async {
     try {
-      await logger.info('DatabaseService', '尝试连接实时加密数据库: $dbPath');
-      
-      if (!File(dbPath).existsSync()) {
-        await logger.error('DatabaseService', '数据库文件不存在: $dbPath');
+      // 规范化路径，支持中文和空格
+      final normalizedPath = PathUtils.normalizeDatabasePath(dbPath);
+      await logger.info('DatabaseService', '尝试连接实时加密数据库: ${PathUtils.escapeForLog(normalizedPath)}');
+
+      if (PathUtils.hasSpecialCharacters(normalizedPath)) {
+        await logger.warning('DatabaseService', '路径包含特殊字符（中文/空格），已规范化处理');
+      }
+
+      if (!File(normalizedPath).existsSync()) {
+        await logger.error('DatabaseService', '数据库文件不存在: ${PathUtils.escapeForLog(normalizedPath)}');
         throw Exception('数据库文件不存在');
       }
 
@@ -121,15 +134,15 @@ class DatabaseService {
         await _sessionDb!.close();
         _sessionDb = null;
       }
-    
+
       // 使用真正的VFS拦截打开加密数据库
       // 在SQLite文件系统层面拦截xRead操作，实时解密数据页
-      _sessionDb = await WeChatVFSNative.openEncryptedDatabase(dbPath, hexKey);
+      _sessionDb = await WeChatVFSNative.openEncryptedDatabase(normalizedPath, hexKey);
 
       _mode = DatabaseMode.realtime;
-      _sessionDbPath = dbPath;
-      _currentAccountWxid = _extractWxidFromPath(dbPath);
-      
+      _sessionDbPath = normalizedPath;
+      _currentAccountWxid = _extractWxidFromPath(normalizedPath);
+
       await logger.info('DatabaseService', '成功连接实时加密数据库，模式: ${_mode.name}, 当前账号wxid: $_currentAccountWxid');
     } catch (e, stackTrace) {
       await logger.error('DatabaseService', '连接实时加密数据库失败', e, stackTrace);
@@ -301,11 +314,12 @@ class DatabaseService {
         }
         
         try {
+          final normalizedDbPath = PathUtils.normalizeDatabasePath(dbPath);
           final tempDb = await _currentFactory.openDatabase(
-            dbPath,
+            normalizedDbPath,
             options: OpenDatabaseOptions(readOnly: true, singleInstance: false),
           );
-          
+
           try {
             final foundTableName = await _getMessageTableName(sessionId, tempDb, dbIndex: i);
             if (foundTableName != null) {
@@ -477,8 +491,9 @@ class DatabaseService {
         }
 
         try {
+          final normalizedDbPath = PathUtils.normalizeDatabasePath(dbPath);
           final tempDb = await _currentFactory.openDatabase(
-            dbPath,
+            normalizedDbPath,
             options: OpenDatabaseOptions(readOnly: true, singleInstance: false),
           );
 
@@ -2310,19 +2325,20 @@ class DatabaseService {
   /// 查找所有可用的消息数据库路径
   Future<List<String>> _findAllMessageDbs() async {
     final List<String> messageDbs = [];
-    
+
     // 优先基于会话库所在 wxid 目录
     if (_sessionDbPath != null) {
       final wxidDir = _findWxidDirFromPath(_sessionDbPath!);
       if (wxidDir != null) {
         // 查找所有 message_[0-9].db 文件
         for (int i = 0; i < 10; i++) {
-          final candidate = File('${wxidDir.path}${Platform.pathSeparator}message_${i}.db');
-        if (await candidate.exists()) {
-            messageDbs.add(candidate.path);
+          final candidatePath = PathUtils.join(wxidDir.path, 'message_$i.db');
+          final candidate = File(candidatePath);
+          if (await candidate.exists()) {
+            messageDbs.add(PathUtils.normalizeDatabasePath(candidate.path));
           }
         }
-        
+
         if (messageDbs.isNotEmpty) {
           return messageDbs;
         }
@@ -2331,19 +2347,21 @@ class DatabaseService {
 
     // 兜底：扫描 EchoTrace 目录
     final documentsDir = await getApplicationDocumentsDirectory();
-    final echoTraceDir = Directory('${documentsDir.path}${Platform.pathSeparator}EchoTrace');
+    final echoTracePath = PathUtils.join(documentsDir.path, 'EchoTrace');
+    final echoTraceDir = Directory(echoTracePath);
     if (!await echoTraceDir.exists()) return messageDbs;
 
     final wxidDirs = await echoTraceDir.list().where((e) => e is Directory).toList();
     for (final dir in wxidDirs) {
       for (int i = 0; i < 100; i++) {
-        final messageDbFile = File('${dir.path}${Platform.pathSeparator}message_${i}.db');
+        final messageDbPath = PathUtils.join(dir.path, 'message_$i.db');
+        final messageDbFile = File(messageDbPath);
         if (await messageDbFile.exists()) {
-          messageDbs.add(messageDbFile.path);
+          messageDbs.add(PathUtils.normalizeDatabasePath(messageDbFile.path));
         }
       }
     }
-    
+
     return messageDbs;
   }
 
@@ -2601,11 +2619,12 @@ class DatabaseService {
       for (int i = 0; i < uniquePaths.length; i++) {
         final dbPath = uniquePaths[i];
         try {
+          final normalizedDbPath = PathUtils.normalizeDatabasePath(dbPath);
           final db = await _currentFactory.openDatabase(
-            dbPath,
+            normalizedDbPath,
             options: OpenDatabaseOptions(readOnly: true, singleInstance: false),
           );
-          _cachedMessageDbs[dbPath] = db;
+          _cachedMessageDbs[normalizedDbPath] = db;
         } catch (e) {
           // 忽略打开失败的数据库
         }

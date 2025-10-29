@@ -80,9 +80,20 @@ class GoDecryptFFI {
         .asFunction();
   }
 
+  /// 规范化文件路径（确保使用正确的路径分隔符，支持中文和空格）
+  String _normalizePath(String path) {
+    // 在 Windows 上，确保使用反斜杠
+    // toNativeUtf8() 已经支持 UTF-8 编码，可以正确处理中文
+    if (Platform.isWindows) {
+      return path.replaceAll('/', '\\');
+    }
+    return path;
+  }
+
   /// 验证密钥
   bool validateKey(String dbPath, String hexKey) {
-    final dbPathPtr = dbPath.toNativeUtf8();
+    final normalizedPath = _normalizePath(dbPath);
+    final dbPathPtr = normalizedPath.toNativeUtf8();
     final hexKeyPtr = hexKey.toNativeUtf8();
 
     try {
@@ -97,8 +108,11 @@ class GoDecryptFFI {
   /// 解密数据库
   /// 返回 null 表示成功，否则返回错误消息
   String? decryptDatabase(String inputPath, String outputPath, String hexKey) {
-    final inputPathPtr = inputPath.toNativeUtf8();
-    final outputPathPtr = outputPath.toNativeUtf8();
+    final normalizedInputPath = _normalizePath(inputPath);
+    final normalizedOutputPath = _normalizePath(outputPath);
+
+    final inputPathPtr = normalizedInputPath.toNativeUtf8();
+    final outputPathPtr = normalizedOutputPath.toNativeUtf8();
     final hexKeyPtr = hexKey.toNativeUtf8();
 
     try {
@@ -126,7 +140,8 @@ class GoDecryptFFI {
   /// 强制解锁文件（关闭所有占用该文件的句柄）
   /// 返回 null 表示成功，否则返回错误消息
   String? forceUnlockFile(String filePath) {
-    final filePathPtr = filePath.toNativeUtf8();
+    final normalizedPath = _normalizePath(filePath);
+    final filePathPtr = normalizedPath.toNativeUtf8();
 
     try {
       final errorPtr = _forceUnlockFile(filePathPtr.cast());
@@ -147,7 +162,8 @@ class GoDecryptFFI {
   /// 关闭当前进程中所有指向指定文件的句柄
   /// 返回 null 表示成功，否则返回错误消息
   String? closeSelfFileHandles(String filePath) {
-    final filePathPtr = filePath.toNativeUtf8();
+    final normalizedPath = _normalizePath(filePath);
+    final filePathPtr = normalizedPath.toNativeUtf8();
 
     try {
       final errorPtr = _closeSelfFileHandles(filePathPtr.cast());

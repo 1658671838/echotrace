@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:path/path.dart' as path;
+import '../utils/path_utils.dart';
 
 /// 图片服务 - 处理微信图片的查找和显示
 class ImageService {
@@ -20,15 +21,16 @@ class ImageService {
     try {
       if (_dataPath == null) return;
 
-      final hardlinkPath = path.join(_dataPath!, 'hardlink.db');
+      final hardlinkPath = PathUtils.join(_dataPath!, 'hardlink.db');
       final file = File(hardlinkPath);
 
       if (!await file.exists()) {
         return;
       }
 
+      final normalizedPath = PathUtils.normalizeDatabasePath(hardlinkPath);
       _hardlinkDb = await databaseFactory.openDatabase(
-        hardlinkPath,
+        normalizedPath,
         options: OpenDatabaseOptions(
           readOnly: true,
           singleInstance: false,

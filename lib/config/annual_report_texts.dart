@@ -98,8 +98,8 @@ class AnnualReportTexts {
   // 示例："发送比例 2.18"
   static const friendshipRatio = '发送比例 ';
   
-  // [显示效果] 底部温馨寄语
-  static const friendshipClosing = '琐碎的日常，有人愿意倾听，本身就是一件很棒的事';
+  // [显示效果] 底部寄语
+  static const friendshipClosing = '得不到的永远在骚动\n被偏爱的都有恃无恐';
 
   // ========== 双向奔赴 ==========
   // [显示效果] 页面标题

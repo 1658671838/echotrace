@@ -5,6 +5,7 @@ import 'package:ffi/ffi.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:pointycastle/export.dart';
 import 'package:cryptography/cryptography.dart';
+import '../utils/path_utils.dart';
 
 // C++函数签名
 typedef RegisterVFSNative = Int32 Function();
@@ -121,37 +122,40 @@ class WeChatVFSNative {
     if (!_initialized) {
       if (!initialize()) return false;
     }
-    
+
     try {
+      // 规范化路径，支持中文和空格
+      final normalizedPath = PathUtils.normalizeDatabasePath(dbPath);
+
       final key = _hexToBytes(hexKey);
       if (key.length != keySize) {
         throw Exception('密钥长度必须为64个字符（32字节）');
       }
-      
+
       // 读取salt
-      final file = File(dbPath);
+      final file = File(normalizedPath);
       final bytes = await file.openRead(0, pageSize).first;
       final salt = bytes.sublist(0, saltSize);
-      
-      
+
+
       // 派生密钥
       final encKey = await _deriveEncryptionKey(key, salt);
       final macKey = await _deriveMacKey(encKey, salt);
-      
-      
-      // 保存加密上下文
-      _contexts[dbPath] = _EncryptionContext(encKey, macKey);
-      
-      
+
+
+      // 保存加密上下文（使用规范化路径作为key）
+      _contexts[normalizedPath] = _EncryptionContext(encKey, macKey);
+
+
       // 转换密钥为hex字符串
       String encKeyHex = encKey.map((b) => b.toRadixString(16).padLeft(2, '0')).join('');
       String macKeyHex = macKey.map((b) => b.toRadixString(16).padLeft(2, '0')).join('');
-      
+
       // 注册密钥（传递给C++，由C++完成解密）
-      final pathPtr = dbPath.toNativeUtf8();
+      final pathPtr = normalizedPath.toNativeUtf8();
       final encKeyPtr = encKeyHex.toNativeUtf8();
       final macKeyPtr = macKeyHex.toNativeUtf8();
-      
+
       _registerCallback!(pathPtr, encKeyPtr, macKeyPtr);
       
       malloc.free(pathPtr);
@@ -297,43 +301,49 @@ class WeChatVFSNative {
   /// 注销数据库加密密钥
   static void unregisterDatabaseKey(String dbPath) {
     if (!_initialized) return;
-    
-    final pathPtr = dbPath.toNativeUtf8();
+
+    // 规范化路径
+    final normalizedPath = PathUtils.normalizeDatabasePath(dbPath);
+
+    final pathPtr = normalizedPath.toNativeUtf8();
     try {
       _unregisterCallback!(pathPtr);
-      _contexts.remove(dbPath);
+      _contexts.remove(normalizedPath);
     } finally {
       malloc.free(pathPtr);
     }
   }
-  
+
   /// 使用VFS打开加密数据库
   static Future<Database> openEncryptedDatabase(String dbPath, String hexKey) async {
+    // 规范化路径
+    final normalizedPath = PathUtils.normalizeDatabasePath(dbPath);
+
     // 注册密钥和回调
-    if (!await registerDatabaseKey(dbPath, hexKey)) {
+    if (!await registerDatabaseKey(normalizedPath, hexKey)) {
       throw Exception('注册加密密钥失败');
     }
-    
+
     try {
-      
+
       // 使用sqflite_common_ffi在当前isolate中打开数据库
       // 这确保VFS回调也在同一isolate中执行
       final db = await databaseFactoryFfi.openDatabase(
-        dbPath,
+        normalizedPath,
         options: OpenDatabaseOptions(
           readOnly: true,
           singleInstance: false,
         ),
       );
-      
-      
+
+
       return db;
     } catch (e) {
-      unregisterDatabaseKey(dbPath);
+      unregisterDatabaseKey(normalizedPath);
       rethrow;
     }
   }
-  
+
   /// 关闭加密数据库
   static Future<void> closeEncryptedDatabase(Database db, String dbPath) async {
     await db.close();
