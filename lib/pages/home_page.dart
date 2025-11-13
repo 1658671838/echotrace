@@ -9,6 +9,7 @@ import 'welcome_page.dart';
 import 'data_management_page.dart';
 import 'analytics_page.dart';
 import 'chat_export_page.dart';
+import 'group_chat_analysis_page.dart';
 
 /// 应用主页面，包含侧边栏和内容区域
 class HomePage extends StatelessWidget {
@@ -46,6 +47,8 @@ class HomePage extends StatelessWidget {
                     } else if (appState.isConfigured &&
                         appState.currentPage == 'chat') {
                       currentPage = const ChatPage();
+                    } else if (appState.currentPage == 'group_chat_analysis') {
+                      currentPage = const GroupChatAnalysisPage();
                     } else {
                       currentPage = const WelcomePage();
                     }

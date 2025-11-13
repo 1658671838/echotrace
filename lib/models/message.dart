@@ -33,6 +33,11 @@ class Message {
   // 解析后的显示内容
   final String _parsedContent;
 
+    DateTime get createTimeDt {
+    // createTime 是秒级时间戳，需要乘以1000转为毫秒
+    return DateTime.fromMillisecondsSinceEpoch(createTime * 1000);
+  }
+
   Message({
     required this.localId,
     required this.serverId,

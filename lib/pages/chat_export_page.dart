@@ -29,6 +29,9 @@ class _ChatExportPageState extends State<ChatExportPage> {
   String? _exportFolder;
   bool _useAllTime = false;
   bool _isExportingContacts = false;
+  
+  // 添加静态缓存变量，用于存储会话列表
+  static List<ChatSession>? _cachedSessions;
 
   @override
   void initState() {
@@ -166,6 +169,15 @@ class _ChatExportPageState extends State<ChatExportPage> {
   }
 
   Future<void> _loadSessions() async {
+    // 首先检查缓存是否存在
+    if (_cachedSessions != null) {
+      setState(() {
+        _allSessions = _cachedSessions!;
+        _isLoadingSessions = false;
+      });
+      return;
+    }
+
     setState(() {
       _isLoadingSessions = true;
     });
@@ -196,6 +208,9 @@ class _ChatExportPageState extends State<ChatExportPage> {
             session.username.contains('@chatroom');
       }).toList();
 
+      // 保存到缓存
+      _cachedSessions = filteredSessions;
+
       if (mounted) {
         setState(() {
           _allSessions = filteredSessions;
@@ -211,6 +226,25 @@ class _ChatExportPageState extends State<ChatExportPage> {
           context,
         ).showSnackBar(SnackBar(content: Text('加载会话列表失败: $e')));
       }
+    }
+  }
+
+  // 修改刷新方法，清除缓存后重新加载
+  Future<void> _refreshSessions() async {
+    // 清除缓存
+    _cachedSessions = null;
+    // 清除已选会话，避免刷新后选中状态与新列表不匹配
+    setState(() {
+      _selectedSessions.clear();
+      _selectAll = false;
+    });
+    // 重新加载数据
+    await _loadSessions();
+    
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('会话列表已刷新')),
+      );
     }
   }
 
@@ -405,7 +439,7 @@ class _ChatExportPageState extends State<ChatExportPage> {
           const Spacer(),
           IconButton(
             icon: const Icon(Icons.refresh),
-            onPressed: _loadSessions,
+            onPressed: _refreshSessions, // 修改为使用新的刷新方法
             tooltip: '刷新列表',
           ),
         ],
