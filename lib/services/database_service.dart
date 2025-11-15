@@ -2377,7 +2377,7 @@ class DatabaseService {
     return resolved;
   }
 
-  /// 批量获取联系人显示名称（remark > nick_name > username）
+  /// 批量获取联系人显示名称（remark > nick_name > alias > username）
   Future<Map<String, String>> getDisplayNames(List<String> usernames) async {
     if (_sessionDb == null || usernames.isEmpty) {
       return {};
@@ -2448,11 +2448,12 @@ class DatabaseService {
             final remark = row['remark'] as String?;
             final alias = row['alias'] as String?;
             final nickName = row['nick_name'] as String?;
+            // 显示名优先级：remark > nick_name > alias > username
             final displayName = remark?.isNotEmpty == true
                 ? remark!
-                : (alias?.isNotEmpty == true
-                    ? alias!
-                    : (nickName?.isNotEmpty == true ? nickName! : username));
+                : (nickName?.isNotEmpty == true
+                    ? nickName!
+                    : (alias?.isNotEmpty == true ? alias! : username));
             assignDisplayName(username, displayName);
           }
         }
@@ -2556,6 +2557,110 @@ class DatabaseService {
         } catch (e) {
           // 忽略关闭错误
         }
+      }
+    } catch (e) {
+      return {};
+    }
+  }
+
+  /// 批量获取联系人头像URL（优先 big_head_url，其次 small_head_url）
+  Future<Map<String, String>> getAvatarUrls(List<String> usernames) async {
+    if (_sessionDb == null || usernames.isEmpty) {
+      return {};
+    }
+
+    try {
+      final contactDbPath = await getContactDatabasePath();
+      if (contactDbPath == null) {
+        await logger.warning('DatabaseService', '未找到contact数据库，无法获取头像');
+        return {};
+      }
+
+      final contactDb = await _currentFactory.openDatabase(
+        contactDbPath,
+        options: OpenDatabaseOptions(readOnly: true, singleInstance: false),
+      );
+
+      try {
+        final result = <String, String>{};
+
+        Future<void> queryTableForAvatars(
+          String table,
+          List<String> targets,
+        ) async {
+          if (targets.isEmpty) return;
+          final placeholders = List.filled(targets.length, '?').join(',');
+          final rows = await contactDb.rawQuery(
+            '''
+            SELECT username,
+                   CASE 
+                     WHEN big_head_url IS NOT NULL AND TRIM(big_head_url) != '' THEN big_head_url
+                     WHEN small_head_url IS NOT NULL AND TRIM(small_head_url) != '' THEN small_head_url
+                     ELSE ''
+                   END AS avatar_url
+            FROM $table
+            WHERE username IN ($placeholders)
+          ''',
+            targets,
+          );
+          for (final row in rows) {
+            final username = row['username'] as String?;
+            final url = row['avatar_url'] as String?;
+            if (username != null && (url != null && url.isNotEmpty)) {
+              result[username] = url;
+            }
+          }
+        }
+
+        // 先从 contact 表查
+        await queryTableForAvatars('contact', usernames);
+
+        // 对未命中的再从 stranger 表查
+        final notFound = usernames.where((u) => !result.containsKey(u)).toList();
+        if (notFound.isNotEmpty) {
+          try {
+            await queryTableForAvatars('stranger', notFound);
+          } catch (e) {
+            // 忽略 stranger 表结构差异
+          }
+        }
+
+        // 对于群聊ID存在变体的情况（可能用户名包含额外后缀），尝试模糊匹配
+        final stillMissing = usernames
+            .where((u) => !result.containsKey(u) && u.contains('@chatroom'))
+            .toList();
+        for (final u in stillMissing) {
+          try {
+            final id = u.split('@').first;
+            final rows = await contactDb.rawQuery(
+              '''
+              SELECT CASE 
+                       WHEN big_head_url IS NOT NULL AND TRIM(big_head_url) != '' THEN big_head_url
+                       WHEN small_head_url IS NOT NULL AND TRIM(small_head_url) != '' THEN small_head_url
+                       ELSE ''
+                     END AS avatar_url
+              FROM contact
+              WHERE username LIKE ?
+              LIMIT 1
+            ''',
+              ['%$id%'],
+            );
+            if (rows.isNotEmpty) {
+              final url = rows.first['avatar_url'] as String?;
+              if (url != null && url.isNotEmpty) {
+                result[u] = url;
+              }
+            }
+          } catch (e) {
+            // 忽略单个错误
+          }
+        }
+
+        return result;
+      } finally {
+        try {
+          await contactDb.close();
+        } catch (_) {}
       }
     } catch (e) {
       return {};
@@ -4487,6 +4592,135 @@ class DatabaseService {
       await log('分析响应速度失败: $e\n堆栈: $stackTrace', level: 'error');
       rethrow;
     }
+  }
+
+
+  // 文件: lib/services/database_service.dart
+
+  /// 获取群聊的活跃时段数据（24小时分布） - [重构后版本]
+  Future<Map<int, int>> getGroupActiveHours({
+    required String chatroomId,
+    required DateTime startDate,
+    required DateTime endDate,
+  }) async {
+    if (!isConnected) {
+      throw Exception('数据库未连接');
+    }
+
+    // 1. 初始化一个包含0-23小时，计数值都为0的Map
+    final hourlyCounts = Map<int, int>.fromEntries(
+      List.generate(24, (i) => MapEntry(i, 0)),
+    );
+
+    try {
+      final endOfDay = DateTime(endDate.year, endDate.month, endDate.day, 23, 59, 59);
+      final startTime = startDate.millisecondsSinceEpoch ~/ 1000;
+      final endTime = endOfDay.millisecondsSinceEpoch ~/ 1000;
+
+      // --- 使用 print 进行诊断 ---
+      print('--- [DB Service - ActiveHours] ---');
+      print('开始获取活跃时段数据...');
+      print('Chatroom ID: $chatroomId');
+      print('Start Timestamp: $startTime (${startDate.toLocal()})');
+      print('End Timestamp: $endTime (${endOfDay.toLocal()})');
+
+      // 2. 复用已经能正常工作的 getMessagesByDate 方法！
+      // 这是最关键的改动，确保我们能和“群聊排行”一样获取到数据。
+      final messages = await getMessagesByDate(
+        chatroomId,
+        startTime,
+        endTime,
+      );
+
+      // --- 关键诊断日志 ---
+      // 观察这里打印的消息数量是否大于0
+      print('getMessagesByDate 返回了 ${messages.length} 条消息');
+
+      // 3. 在 Dart 中对消息进行按小时统计
+      for (final message in messages) {
+        // 从秒级时间戳创建 DateTime 对象
+        final messageTime = DateTime.fromMillisecondsSinceEpoch(message.createTime * 1000);
+        // 获取小时 (0-23)
+        final hour = messageTime.hour;
+        // 累加计数
+        hourlyCounts[hour] = (hourlyCounts[hour] ?? 0) + 1;
+      }
+
+      // --- 打印最终结果 ---
+      print('最终聚合的小时数据: $hourlyCounts');
+      print('--- [DB Service - ActiveHours] 结束 ---');
+
+    } catch (e, stackTrace) {
+      print('获取群聊活跃时段数据时发生严重错误: $e');
+      print('堆栈跟踪: $stackTrace');
+    }
+    
+    return hourlyCounts;
+  }
+
+  /// 获取群聊的媒体类型统计数据（只统计已知类型）
+  Future<Map<int, int>> getGroupMediaTypeStats({
+    required String chatroomId,
+    required DateTime startDate,
+    required DateTime endDate,
+  }) async {
+    if (!isConnected) {
+      throw Exception('数据库未连接');
+    }
+    
+    final typeCounts = <int, int>{};
+    // 定义已知类型的白名单集合
+    const knownTypes = {
+      1, 3, 34, 42, 43, 47, 48, 10000, 244813135921, 17179869233,
+      21474836529, 154618822705, 12884901937, 8594229559345, 81604378673,
+      266287972401, 8589934592049, 270582939697, 25769803825
+    };
+
+    try {
+      final endOfDay = DateTime(endDate.year, endDate.month, endDate.day, 23, 59, 59);
+      final startTime = startDate.millisecondsSinceEpoch ~/ 1000;
+      final endTime = endOfDay.millisecondsSinceEpoch ~/ 1000;
+
+      final dbInfos = await _collectTableInfosAcrossDatabases(chatroomId);
+      
+      if (dbInfos.isEmpty) {
+        return typeCounts;
+      }
+      
+      for (final dbInfo in dbInfos) {
+        try {
+          final result = await dbInfo.database.rawQuery(
+            '''
+            SELECT 
+              local_type, 
+              COUNT(*) as count 
+            FROM ${dbInfo.tableName}
+            WHERE create_time BETWEEN ? AND ?
+            GROUP BY local_type
+            ''',
+            [startTime, endTime],
+          );
+          
+          for (final row in result) {
+            final type = row['local_type'] as int?;
+            final count = row['count'] as int?;
+            
+            // --- 核心改动：只处理白名单中的已知类型 ---
+            if (type != null && count != null && knownTypes.contains(type)) {
+              typeCounts[type] = (typeCounts[type] ?? 0) + count;
+            }
+          }
+        } catch (e) {
+          // 在生产环境中，可以替换为日志记录
+          // print('[DB Service - MediaStats] 警告: 查询媒体统计时，处理表 ${dbInfo.tableName} 失败: $e');
+        }
+      } 
+    } catch (e) {
+      // 在生产环境中，可以替换为日志记录
+      // print('[DB Service - MediaStats] 严重错误: 获取媒体统计数据失败: $e');
+    }
+    
+    return typeCounts;
   }
 }
 

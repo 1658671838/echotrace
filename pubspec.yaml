@@ -39,6 +39,10 @@ dependencies:
   sqflite_common_ffi: ^2.3.0
   crypto: ^3.0.3
   pointycastle: ^4.0.0
+
+  fl_chart: ^0.64.0      # 用于绘制图表
+  file_saver: ^0.2.12    # 用于导出JSON文件
+
   
   # 文件操作和路径
   file_picker: ^10.3.3
@@ -83,6 +87,8 @@ dependencies:
   # 图片处理
   image: ^4.1.7
 
+  jieba_flutter: ^0.2.0
+  
 dev_dependencies:
   flutter_test:
     sdk: flutter

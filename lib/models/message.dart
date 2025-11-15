@@ -33,6 +33,12 @@ class Message {
   // 解析后的显示内容
   final String _parsedContent;
 
+    DateTime get createTimeDt {
+    // createTime 是秒级时间戳，需要乘以1000转为毫秒
+    return DateTime.fromMillisecondsSinceEpoch(createTime * 1000);
+  }
+  
+
   Message({
     required this.localId,
     required this.serverId,
@@ -564,8 +570,9 @@ class Message {
     return null;
   }
 
-  /// 获取消息类型描述
-  String get typeDescription {
+  // --- 在这里添加新的【静态】方法 ---
+  // 这个方法可以直接通过类名调用：Message.getTypeDescriptionFromInt(1)
+  static String getTypeDescriptionFromInt(int localType) {
     switch (localType) {
       case 1:
         return '文本消息';
@@ -605,10 +612,22 @@ class Message {
         return '视频号直播卡片';
       case 25769803825:
         return '文件消息';
+          case 34359738417:
+        return '文件消息';
+          case 103079215153:
+        return '文件消息';
       default:
-        return '未知消息类型($localType)';
+        return '未知类型($localType)';
     }
   }
+
+  /// 获取消息类型描述 - [这个是您已有的实例 getter，保持不变]
+  String get typeDescription {
+    // 内部直接调用我们新的静态方法，避免代码重复
+    return Message.getTypeDescriptionFromInt(localType);
+  }
+
+  
 
   /// 获取格式化的创建时间
   String get formattedCreateTime {
