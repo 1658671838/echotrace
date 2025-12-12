@@ -43,7 +43,7 @@ class ChatSession {
 
   /// 从数据库Map创建ChatSession对象
   factory ChatSession.fromMap(Map<String, dynamic> map) {
-    int _intValue(List<String> keys, {int defaultValue = 0}) {
+    int intValue(List<String> keys, {int defaultValue = 0}) {
       for (final key in keys) {
         if (map.containsKey(key) && map[key] != null) {
           final v = map[key];
@@ -56,7 +56,7 @@ class ChatSession {
       return defaultValue;
     }
 
-    String _stringValue(List<String> keys) {
+    String stringValue(List<String> keys) {
       for (final key in keys) {
         if (map.containsKey(key) && map[key] != null) {
           return _cleanString(map[key]);
@@ -66,33 +66,33 @@ class ChatSession {
     }
 
     return ChatSession(
-      username: _stringValue(['username', 'user_name', 'userName']),
-      type: _intValue(['type']),
-      unreadCount: _intValue(['unread_count', 'unreadCount']),
-      unreadFirstMsgSrvId: _intValue([
+      username: stringValue(['username', 'user_name', 'userName']),
+      type: intValue(['type']),
+      unreadCount: intValue(['unread_count', 'unreadCount']),
+      unreadFirstMsgSrvId: intValue([
         'unread_first_msg_srv_id',
         'unreadFirstMsgSrvId',
       ]),
-      isHidden: _intValue(['is_hidden', 'isHidden']),
-      summary: _stringValue(['summary', 'digest']),
-      draft: _stringValue(['draft']),
-      status: _intValue(['status']),
-      lastTimestamp: _intValue(['last_timestamp', 'lastTimestamp']),
-      sortTimestamp: _intValue(['sort_timestamp', 'sortTimestamp']),
-      lastClearUnreadTimestamp: _intValue([
+      isHidden: intValue(['is_hidden', 'isHidden']),
+      summary: stringValue(['summary', 'digest']),
+      draft: stringValue(['draft']),
+      status: intValue(['status']),
+      lastTimestamp: intValue(['last_timestamp', 'lastTimestamp']),
+      sortTimestamp: intValue(['sort_timestamp', 'sortTimestamp']),
+      lastClearUnreadTimestamp: intValue([
         'last_clear_unread_timestamp',
         'lastClearUnreadTimestamp',
       ]),
-      lastMsgLocalId: _intValue([
+      lastMsgLocalId: intValue([
         'last_msg_locald_id',
         'last_msg_localid',
         'last_msg_local_id',
         'lastMsgLocalId',
       ]),
-      lastMsgType: _intValue(['last_msg_type', 'lastMsgType']),
-      lastMsgSubType: _intValue(['last_msg_sub_type', 'lastMsgSubType']),
-      lastMsgSender: _stringValue(['last_msg_sender', 'lastMsgSender']),
-      lastSenderDisplayName: _stringValue([
+      lastMsgType: intValue(['last_msg_type', 'lastMsgType']),
+      lastMsgSubType: intValue(['last_msg_sub_type', 'lastMsgSubType']),
+      lastMsgSender: stringValue(['last_msg_sender', 'lastMsgSender']),
+      lastSenderDisplayName: stringValue([
         'last_sender_display_name',
         'lastSenderDisplayName',
       ]),
@@ -163,9 +163,11 @@ class ChatSession {
       return '群聊';
     } else if (username.startsWith('gh_')) {
       return '公众号';
-    } else if (username.startsWith('wxid_') || username.contains('@')) {
+    } else if (username.contains('@')) {
       return '私聊';
     }
+    // 默认将非群聊/公众号的账号视为私聊，无需限定前缀
+    if (username.isNotEmpty) return '私聊';
 
     // Fallback到type字段
     switch (type) {

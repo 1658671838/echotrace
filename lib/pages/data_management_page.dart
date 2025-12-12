@@ -183,16 +183,20 @@ class _DataManagementPageState extends State<DataManagementPage>
 
   /// 清理账号目录名，去除微信自动添加的后缀
   String _cleanAccountDirName(String dirName) {
-    // 如果是 wxid_ 开头，去除后面可能的 _数字 后缀
-    if (dirName.startsWith('wxid_')) {
-      // 匹配 wxid_ 开头，后面跟着字母数字但不包含下划线的部分
-      final match = RegExp(r'wxid_[a-zA-Z0-9]+').firstMatch(dirName);
-      if (match != null) {
-        return match.group(0)!;
-      }
+    final trimmed = dirName.trim();
+    if (trimmed.isEmpty) return trimmed;
+
+    // 兼容旧版 wxid_xxx_123 目录，去掉尾部数字
+    final legacyMatch = RegExp(
+      r'^(wxid_[a-zA-Z0-9]+)(?:_\d+)?$',
+      caseSensitive: false,
+    ).firstMatch(trimmed);
+    if (legacyMatch != null) {
+      return legacyMatch.group(1)!;
     }
-    // 非 wxid_ 格式的账号目录（新版微信），直接返回
-    return dirName;
+
+    // 其他命名直接返回
+    return trimmed;
   }
 
   /// 智能扫描数据库路径

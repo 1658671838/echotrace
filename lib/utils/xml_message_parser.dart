@@ -30,9 +30,9 @@ class XmlMessageParser {
       final document = XmlDocument.parse(xmlContent);
       final template = document.findAllElements('template').first.text;
 
-      // 提取模板中的所有wxid
-      final wxidRegex = RegExp(r'\$\{(wxid_[a-zA-Z0-9_]+)\}');
-      final matches = wxidRegex.allMatches(template);
+      // 提取模板中的所有账号占位符（不限命名格式）
+      final placeholderRegex = RegExp(r'\$\{([^}]+)\}');
+      final matches = placeholderRegex.allMatches(template);
       final wxids = matches.map((m) => m.group(1)!).toSet().toList();
 
       return {'template': template, 'wxids': wxids};

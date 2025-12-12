@@ -50,6 +50,11 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
   Future<void>? _realtimeRefreshFuture;
   bool _realtimeRefreshQueued = false;
   int _realtimeTick = 0;
+  bool _isAutoConnecting = false;
+  bool _hasAttemptedRefreshAfterConnect = false;
+  bool _autoLoadScheduled = false;
+  Timer? _searchDebounce;
+  String _lastSearchQuery = '';
   StreamSubscription<void>? _dbChangeSubscription;
 
   // 搜索相关
@@ -79,10 +84,14 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
     _loadSessions();
     _scrollController.addListener(_onScroll);
     _loadMyAvatar();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _ensureConnected();
+    });
   }
 
   @override
   void dispose() {
+    _searchDebounce?.cancel();
     _scrollController.dispose();
     _refreshController.dispose();
     _searchAnimationController.dispose();
@@ -94,12 +103,51 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
 
   void _onSearchChanged() async {
     final query = _searchController.text.trim().toLowerCase();
+    if (query == _lastSearchQuery) return;
+    _lastSearchQuery = query;
+
+    _searchDebounce?.cancel();
+    _searchDebounce = Timer(const Duration(milliseconds: 120), () {
+      if (!mounted) return;
+      setState(() {
+        _filteredSessions = _filterSessionsByQuery(_sessions, query);
+        logger.debug('ChatPage', '搜索结果: 找到 ${_filteredSessions.length} 个匹配的会话');
+      });
+    });
     await logger.debug('ChatPage', '搜索关键词: "$query"');
+  }
+
+  Future<void> _ensureConnected() async {
+    final appState = context.read<AppState>();
+    if (!appState.isConfigured) return;
+    if (appState.databaseService.isConnected || appState.isLoading) return;
+    if (_isAutoConnecting) return;
 
     setState(() {
-      _filteredSessions = _filterSessionsByQuery(_sessions, query);
-      logger.debug('ChatPage', '搜索结果: 找到 ${_filteredSessions.length} 个匹配的会话');
+      _isAutoConnecting = true;
+      _hasAttemptedRefreshAfterConnect = false;
     });
+    try {
+      await appState.reconnectDatabase();
+      if (mounted) {
+        await _loadSessions();
+        _hasAttemptedRefreshAfterConnect = true;
+      }
+    } catch (_) {
+      // 失败交给 UI 提示
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isAutoConnecting = false;
+        });
+        // 若仍未连接，再尝试一次刷新会话列表以防遗漏
+        if (!_hasAttemptedRefreshAfterConnect &&
+            appState.databaseService.isConnected) {
+          _hasAttemptedRefreshAfterConnect = true;
+          unawaited(_loadSessions());
+        }
+      }
+    }
   }
 
   Future<void> _loadMyAvatar() async {
@@ -734,8 +782,25 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
   @override
   Widget build(BuildContext context) {
     final appState = context.watch<AppState>();
-    return Row(
+    final isConnecting = appState.isLoading ||
+        _isAutoConnecting ||
+        !appState.databaseService.isConnected;
+    if (!isConnecting &&
+        !_isLoadingSessions &&
+        _sessions.isEmpty &&
+        !_autoLoadScheduled &&
+        appState.databaseService.isConnected) {
+      _autoLoadScheduled = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        if (!mounted) return;
+        _autoLoadScheduled = false;
+        await _loadSessions();
+      });
+    }
+    return Stack(
       children: [
+        Row(
+          children: [
         // 左侧会话列表
         Container(
           width: 300,
@@ -880,62 +945,91 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
                       );
                     }
 
-                    return _isLoadingSessions
-                        ? ShimmerLoading(
-                            isLoading: true,
-                            child: ListView.builder(
-                              itemCount: 6,
-                              physics: const NeverScrollableScrollPhysics(),
-                              itemBuilder: (context, index) =>
-                                  const ListItemShimmer(),
+                    Widget sessionChild;
+                    if (_isLoadingSessions) {
+                      sessionChild = ShimmerLoading(
+                        key: const ValueKey('session-loading'),
+                        isLoading: true,
+                        child: ListView.builder(
+                          itemCount: 6,
+                          physics: const NeverScrollableScrollPhysics(),
+                          itemBuilder: (context, index) =>
+                              const ListItemShimmer(),
+                        ),
+                      );
+                    } else if (_filteredSessions.isEmpty) {
+                      sessionChild = Center(
+                        key: const ValueKey('session-empty'),
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(
+                              _isSearching
+                                  ? Icons.search_off
+                                  : Icons.chat_bubble_outline,
+                              size: 64,
+                              color: Theme.of(context).colorScheme.outline,
                             ),
-                          )
-                        : _filteredSessions.isEmpty
-                        ? Center(
-                            child: Column(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                Icon(
-                                  _isSearching
-                                      ? Icons.search_off
-                                      : Icons.chat_bubble_outline,
-                                  size: 64,
-                                  color: Theme.of(context).colorScheme.outline,
-                                ),
-                                const SizedBox(height: 16),
-                                Text(
-                                  _isSearching ? '未找到匹配的会话' : '暂无会话',
-                                  style: Theme.of(context).textTheme.bodyMedium
-                                      ?.copyWith(
-                                        color: Theme.of(context)
-                                            .colorScheme
-                                            .onSurface
-                                            .withValues(alpha: 0.5),
-                                      ),
-                                ),
-                              ],
+                            const SizedBox(height: 16),
+                            Text(
+                              _isSearching ? '未找到匹配的会话' : '暂无会话',
+                              style: Theme.of(context).textTheme.bodyMedium
+                                  ?.copyWith(
+                                    color: Theme.of(context)
+                                        .colorScheme
+                                        .onSurface
+                                        .withValues(alpha: 0.5),
+                                  ),
                             ),
-                          )
-                        : ListView.builder(
-                            itemCount: _filteredSessions.length,
-                            itemBuilder: (context, index) {
-                              final session = _filteredSessions[index];
-                              return ChatSessionItem(
-                                session: session,
-                                isSelected:
-                                    _selectedSession?.username ==
-                                    session.username,
-                                onTap: () => _loadMessages(session),
-                                avatarUrl: appState.getAvatarUrl(
-                                  session.username,
-                                ),
-                                enableAvatarFade: _shouldAnimateAvatar(
-                                  session.username,
-                                  appState,
-                                ),
-                              );
-                            },
+                          ],
+                        ),
+                      );
+                    } else {
+                      sessionChild = ListView.builder(
+                        key: const ValueKey('session-list'),
+                        cacheExtent: 600,
+                        addAutomaticKeepAlives: false,
+                        keyboardDismissBehavior:
+                            ScrollViewKeyboardDismissBehavior.onDrag,
+                        itemCount: _filteredSessions.length,
+                        itemBuilder: (context, index) {
+                          final session = _filteredSessions[index];
+                          return ChatSessionItem(
+                            session: session,
+                            isSelected:
+                                _selectedSession?.username == session.username,
+                            onTap: () => _loadMessages(session),
+                            avatarUrl: appState.getAvatarUrl(
+                              session.username,
+                            ),
+                            enableAvatarFade: _shouldAnimateAvatar(
+                              session.username,
+                              appState,
+                            ),
                           );
+                        },
+                      );
+                    }
+
+                    return AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 220),
+                      switchInCurve: Curves.easeOut,
+                      switchOutCurve: Curves.easeIn,
+                      transitionBuilder: (child, animation) {
+                        final slide = Tween<Offset>(
+                          begin: const Offset(0, 0.02),
+                          end: Offset.zero,
+                        ).animate(animation);
+                        return FadeTransition(
+                          opacity: animation,
+                          child: SlideTransition(
+                            position: slide,
+                            child: child,
+                          ),
+                        );
+                      },
+                      child: sessionChild,
+                    );
                   },
                 ),
               ),
@@ -992,108 +1086,204 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
                     ),
                     // 消息列表
                     Expanded(
-                      child: _isLoadingMessages
-                          ? const MessageLoadingShimmer()
-                          : _messages.isEmpty
-                          ? Center(
-                              child: Text(
-                                '暂无消息',
-                                style: Theme.of(context).textTheme.bodyMedium
-                                    ?.copyWith(
-                                      color: Theme.of(context)
-                                          .colorScheme
-                                          .onSurface
-                                          .withValues(alpha: 0.5),
+                      child: AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 220),
+                        switchInCurve: Curves.easeOut,
+                        switchOutCurve: Curves.easeIn,
+                        transitionBuilder: (child, animation) {
+                          final slide = Tween<Offset>(
+                            begin: const Offset(0, 0.02),
+                            end: Offset.zero,
+                          ).animate(animation);
+                          return FadeTransition(
+                            opacity: animation,
+                            child: SlideTransition(
+                              position: slide,
+                              child: child,
+                            ),
+                          );
+                        },
+                        child: _isLoadingMessages
+                            ? const MessageLoadingShimmer(
+                                key: ValueKey('msg-loading'),
+                              )
+                            : _messages.isEmpty
+                                ? Center(
+                                    key: const ValueKey('msg-empty'),
+                                    child: Text(
+                                      '暂无消息',
+                                      style: Theme.of(context)
+                                          .textTheme
+                                          .bodyMedium
+                                          ?.copyWith(
+                                            color: Theme.of(context)
+                                                .colorScheme
+                                                .onSurface
+                                                .withValues(alpha: 0.5),
+                                          ),
                                     ),
-                              ),
-                            )
-                          : ListView.builder(
-                              controller: _scrollController,
-                              padding: const EdgeInsets.all(16),
-                              itemCount:
-                                  _messages.length +
-                                  (_isLoadingMoreMessages ? 1 : 0),
-                              itemBuilder: (context, index) {
-                                // 顶部 loader
-                                if (_isLoadingMoreMessages && index == 0) {
-                                  return const Padding(
-                                    padding: EdgeInsets.only(bottom: 12),
-                                    child: Center(
-                                      child: CircularProgressIndicator(),
-                                    ),
-                                  );
-                                }
+                                  )
+                                : ListView.builder(
+                                    key: const ValueKey('msg-list'),
+                                    controller: _scrollController,
+                                    padding: const EdgeInsets.all(16),
+                                    cacheExtent: 800,
+                                    addAutomaticKeepAlives: false,
+                                    itemCount: _messages.length +
+                                        (_isLoadingMoreMessages ? 1 : 0),
+                                    itemBuilder: (context, index) {
+                                      // 顶部 loader
+                                      if (_isLoadingMoreMessages &&
+                                          index == 0) {
+                                        return const Padding(
+                                          padding:
+                                              EdgeInsets.only(bottom: 12),
+                                          child: MessageLoadingShimmer(),
+                                        );
+                                      }
 
-                                final offset = _isLoadingMoreMessages ? 1 : 0;
-                                final message = _messages[index - offset];
+                                      final offset =
+                                          _isLoadingMoreMessages ? 1 : 0;
+                                      final message =
+                                          _messages[index - offset];
 
-                                // 使用统一的方法获取发送者显示名
-                                final senderName = _getSenderDisplayName(
-                                  message,
-                                );
-
-                                // 判断是否需要显示时间分隔符
-                                bool shouldShowTime = false;
-                                if (index - offset == 0) {
-                                  // 第一条消息总是显示时间
-                                  shouldShowTime = true;
-                                } else {
-                                  final previousMessage =
-                                      _messages[index - offset - 1];
-                                  final timeDiff =
-                                      message.createTime -
-                                      previousMessage.createTime;
-                                  // 如果时间间隔超过10分钟（600秒），显示时间分隔符
-                                  shouldShowTime = timeDiff > 600;
-                                }
-
-                                // 选择头像：
-                                // 私聊：使用会话头像；群聊：使用发送者头像
-                                final avatarUrl =
-                                    _selectedSession?.isGroup == true
-                                    ? (message.senderUsername != null
-                                          ? appState.getAvatarUrl(
-                                              message.senderUsername!,
-                                            )
-                                          : null)
-                                    : appState.getAvatarUrl(
-                                        _selectedSession!.username,
+                                      // 使用统一的方法获取发送者显示名
+                                      final senderName = _getSenderDisplayName(
+                                        message,
                                       );
 
-                                final avatarOwner = _isMessageFromMe(message)
-                                    ? appState
-                                              .databaseService
-                                              .currentAccountWxid ??
-                                          ''
-                                    : (message.senderUsername ??
-                                          _selectedSession?.username ??
-                                          '');
-                                final animateAvatar = _shouldAnimateAvatar(
-                                  avatarOwner,
-                                  appState,
-                                );
+                                      // 判断是否需要显示时间分隔符
+                                      bool shouldShowTime = false;
+                                      if (index - offset == 0) {
+                                        // 第一条消息总是显示时间
+                                        shouldShowTime = true;
+                                      } else {
+                                        final previousMessage =
+                                            _messages[index - offset - 1];
+                                        final timeDiff = message.createTime -
+                                            previousMessage.createTime;
+                                        // 如果时间间隔超过10分钟（600秒），显示时间分隔符
+                                        shouldShowTime = timeDiff > 600;
+                                      }
 
-                                return MessageBubble(
-                                  message: message,
-                                  isFromMe: _isMessageFromMe(message),
-                                  senderDisplayName: senderName,
-                                  sessionUsername:
-                                      _selectedSession?.username ?? '',
-                                  shouldShowTime: shouldShowTime,
-                                  avatarUrl: _isMessageFromMe(message)
-                                      ? _myAvatarUrl
-                                      : avatarUrl,
-                                  enableAvatarFade: animateAvatar,
-                                );
-                              },
-                            ),
+                                      // 选择头像：
+                                      // 私聊：使用会话头像；群聊：使用发送者头像
+                                      final avatarUrl =
+                                          _selectedSession?.isGroup == true
+                                              ? (message.senderUsername != null
+                                                  ? appState.getAvatarUrl(
+                                                      message.senderUsername!,
+                                                    )
+                                                  : null)
+                                              : appState.getAvatarUrl(
+                                                  _selectedSession!.username,
+                                                );
+
+                                      final avatarOwner = _isMessageFromMe(
+                                        message,
+                                      )
+                                          ? appState.databaseService
+                                                  .currentAccountWxid ??
+                                              ''
+                                          : (message.senderUsername ??
+                                              _selectedSession?.username ??
+                                              '');
+                                      final animateAvatar =
+                                          _shouldAnimateAvatar(
+                                        avatarOwner,
+                                        appState,
+                                      );
+
+                                      return MessageBubble(
+                                        key: ValueKey(
+                                            'msg-${message.localId}-${message.createTime}'),
+                                        message: message,
+                                        isFromMe: _isMessageFromMe(message),
+                                        senderDisplayName: senderName,
+                                        sessionUsername:
+                                            _selectedSession?.username ?? '',
+                                        shouldShowTime: shouldShowTime,
+                                        avatarUrl: _isMessageFromMe(message)
+                                            ? _myAvatarUrl
+                                            : avatarUrl,
+                                        enableAvatarFade: animateAvatar,
+                                      );
+                                    },
+                                  ),
+                      ),
                     ),
                   ],
                 ),
         ),
       ],
+    ),
+        Positioned.fill(
+          child: AnimatedSwitcher(
+            duration: const Duration(milliseconds: 240),
+            switchInCurve: Curves.easeOut,
+            switchOutCurve: Curves.easeIn,
+            child: isConnecting
+                ? Container(
+                    color: Colors.white.withValues(alpha: 0.9),
+                    child: Center(
+                      child: _buildFancyLoader(context),
+                    ),
+                  )
+                : const SizedBox.shrink(),
+          ),
+        ),
+      ],
     );
   }
+
+  Widget _buildFancyLoader(BuildContext context) {
+    final color = Theme.of(context).colorScheme.primary;
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 500),
+      curve: Curves.easeOut,
+      builder: (context, value, child) {
+        return Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              width: 72,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                children: List.generate(3, (index) {
+                  final delay = index * 0.15;
+                  final t = (value - delay).clamp(0.0, 1.0);
+                  final height = 10 + 26 * Curves.easeInOut.transform(t);
+                  final opacity = 0.2 + 0.6 * t;
+                  return AnimatedContainer(
+                    duration: const Duration(milliseconds: 280),
+                    curve: Curves.easeInOut,
+                    width: 10,
+                    height: height,
+                    decoration: BoxDecoration(
+                      color: color.withValues(alpha: opacity),
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                  );
+                }),
+              ),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              '正在连接数据库...',
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: Theme.of(context)
+                        .colorScheme
+                        .onSurface
+                        .withValues(alpha: 0.8),
+                  ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
 
   Widget _buildSelectedSessionAvatar(BuildContext context, AppState appState) {
     final avatarUrl = _selectedSession != null

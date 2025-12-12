@@ -55,6 +55,10 @@ class DatabaseService {
   final Map<String, Database> _cachedMessageDbs = {};
   DateTime? _cacheLastUsed;
   static const Duration _cacheDuration = Duration(minutes: 5);
+  // 缓存扫描到的消息数据库路径，避免重复的磁盘遍历
+  List<String>? _cachedMessageDbPaths;
+  DateTime? _messageDbCacheTime;
+  static const Duration _messageDbCacheDuration = Duration(seconds: 60);
 
   /// 获取当前数据库路径
   String? get dbPath => _sessionDbPath;
@@ -128,6 +132,8 @@ class DatabaseService {
       _mode = DatabaseMode.decrypted;
       _sessionDbPath = normalizedPath;
       _contactDbPath = null;
+      _cachedMessageDbPaths = null;
+      _messageDbCacheTime = null;
       _currentAccountWxid =
           (_manualWxid != null && _manualWxid!.isNotEmpty)
               ? _manualWxid
@@ -208,6 +214,8 @@ class DatabaseService {
       _mode = DatabaseMode.realtime;
       _sessionDbPath = normalizedPath;
       _contactDbPath = null;
+      _cachedMessageDbPaths = null;
+      _messageDbCacheTime = null;
       _currentAccountWxid =
           (_manualWxid != null && _manualWxid!.isNotEmpty)
               ? _manualWxid
@@ -279,7 +287,7 @@ class DatabaseService {
   Database? get _currentDb => _sessionDb;
 
   /// 获取会话列表
-  Future<List<ChatSession>> getSessions() async {
+  Future<List<ChatSession>> getSessions({int limit = 400}) async {
     // 实时模式：通过 WCDB DLL 获取会话
     if (_mode == DatabaseMode.realtime && _wcdbHandle != null) {
       try {
@@ -400,6 +408,7 @@ class DatabaseService {
       final List<Map<String, dynamic>> maps = await db.query(
         sessionTableName,
         orderBy: 'sort_timestamp DESC',
+        limit: limit,
       );
 
       await logger.info('DatabaseService', '查询到 ${maps.length} 条原始会话记录');
@@ -2515,6 +2524,8 @@ class DatabaseService {
     await clearDatabaseCache();
     await logger.info('DatabaseService', '已清理缓存的数据库连接');
     _stopRealtimeWatcher();
+    _cachedMessageDbPaths = null;
+    _messageDbCacheTime = null;
 
     // 如果有实时调用在运行，等待它们结束，避免关闭句柄时崩溃
     if (_mode == DatabaseMode.realtime && _activeWcdbOps > 0) {
@@ -3318,9 +3329,8 @@ class DatabaseService {
               } else if (localType == 0 || localType == 1) {
                 // 正常联系人 (0=好友, 1=可能是好友)
                 shouldShow = true;
-              } else if (username.startsWith('wxid_') &&
-                  !username.contains('@')) {
-                // 普通微信用户
+              } else if (!username.contains('@')) {
+                // 普通用户（不限命名格式）
                 shouldShow = true;
               }
 
@@ -3560,6 +3570,14 @@ class DatabaseService {
 
   /// 查找所有可用的消息数据库路径
   Future<List<String>> _findAllMessageDbs() async {
+    // 缓存命中：降低频繁扫描磁盘导致的卡顿
+    if (_cachedMessageDbPaths != null &&
+        _messageDbCacheTime != null &&
+        DateTime.now().difference(_messageDbCacheTime!) <
+            _messageDbCacheDuration) {
+      return List<String>.from(_cachedMessageDbPaths!);
+    }
+
     final List<String> messageDbs = [];
 
     // 优先基于会话库所在 wxid 目录
@@ -3603,6 +3621,8 @@ class DatabaseService {
       }
     }
 
+    _cachedMessageDbPaths = messageDbs.toList();
+    _messageDbCacheTime = DateTime.now();
     return messageDbs;
   }
 
@@ -3616,16 +3636,20 @@ class DatabaseService {
 
   /// 清理账号目录名，去除微信自动添加的后缀
   String _cleanAccountDirName(String dirName) {
-    // 如果是 wxid_ 开头，去除后面可能的 _数字 后缀
-    if (dirName.startsWith('wxid_')) {
-      // 匹配 wxid_ 开头，后面跟着字母数字但不包含下划线的部分
-      final match = RegExp(r'wxid_[a-zA-Z0-9]+').firstMatch(dirName);
-      if (match != null) {
-        return match.group(0)!;
-      }
+    final trimmed = dirName.trim();
+    if (trimmed.isEmpty) return trimmed;
+
+    // 兼容旧版 wxid_xxx_123 目录，去掉尾部数字
+    final legacyMatch = RegExp(
+      r'^(wxid_[a-zA-Z0-9]+)(?:_\d+)?$',
+      caseSensitive: false,
+    ).firstMatch(trimmed);
+    if (legacyMatch != null) {
+      return legacyMatch.group(1)!;
     }
-    // 非 wxid_ 格式的账号目录（新版微信），直接返回
-    return dirName;
+
+    // 其他命名直接返回
+    return trimmed;
   }
 
   String _normalizeUsernameForLookup(String username) {
@@ -3706,11 +3730,9 @@ class DatabaseService {
       return Directory(accountDirPath);
     }
 
-    // 策略3: 向后兼容，检查父目录是否以 wxid_ 开头
+    // 策略3: 向后兼容，直接返回父目录作为账号目录
     final dir = Directory(path).parent;
-    if (dir.path.split(Platform.pathSeparator).last.startsWith('wxid_')) {
-      return dir;
-    }
+    if (dir.path != path) return dir;
 
     return null;
   }
@@ -3799,6 +3821,8 @@ class DatabaseService {
     }
     _cachedMessageDbs.clear();
     _cacheLastUsed = null;
+    _cachedMessageDbPaths = null;
+    _messageDbCacheTime = null;
   }
 
   /// 获取会话的详细信息（包括所在表、加好友时间等）

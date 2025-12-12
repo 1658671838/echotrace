@@ -37,6 +37,13 @@ class WxidScanService {
         if (normalized == null) continue;
 
         final keyInfo = File(p.join(entity.path, 'key_info.dat'));
+        final dbStorageDir = Directory(p.join(entity.path, 'db_storage'));
+
+        // 没有关键文件或 db_storage 的目录忽略，避免误报
+        if (!await dbStorageDir.exists() && !await keyInfo.exists()) {
+          continue;
+        }
+
         DateTime modified;
         if (await keyInfo.exists()) {
           modified = (await keyInfo.stat()).modified;
@@ -95,11 +102,19 @@ class WxidScanService {
 
   /// 纠正 wxid 目录名，去掉末尾的 _数字 后缀
   String? _normalizeWxid(String name) {
-    final lower = name.toLowerCase();
-    if (!lower.startsWith('wxid_')) return null;
-    final match = RegExp(r'^(wxid_[a-z0-9]+)(?:_\d+)?$', caseSensitive: false)
-        .firstMatch(lower);
-    if (match == null) return null;
-    return match.group(1);
+    final trimmed = name.trim();
+    if (trimmed.isEmpty) return null;
+
+    // 兼容旧版目录：wxid_xxx 或 wxid_xxx_123 -> wxid_xxx
+    final legacyMatch = RegExp(
+      r'^(wxid_[a-z0-9]+)(?:_\d+)?$',
+      caseSensitive: false,
+    ).firstMatch(trimmed);
+    if (legacyMatch != null) {
+      return legacyMatch.group(1);
+    }
+
+    // 其他账号名称直接返回原始目录名
+    return trimmed;
   }
 }

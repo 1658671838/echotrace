@@ -164,9 +164,20 @@ class _SettingsPageState extends State<SettingsPage> {
 
   /// 从目录名提取 wxid
   String? _extractWxidFromDirName(String dirName) {
-    final match = RegExp(r'wxid_[a-zA-Z0-9]+').firstMatch(dirName);
-    if (match != null) return match.group(0);
-    return dirName.isNotEmpty ? dirName : null;
+    final trimmed = dirName.trim();
+    if (trimmed.isEmpty) return null;
+
+    // 兼容旧版 wxid_xxx_123 目录，去掉尾部数字
+    final legacyMatch = RegExp(
+      r'^(wxid_[a-zA-Z0-9]+)(?:_\d+)?$',
+      caseSensitive: false,
+    ).firstMatch(trimmed);
+    if (legacyMatch != null) {
+      return legacyMatch.group(1);
+    }
+
+    // 其他命名直接返回
+    return trimmed;
   }
 
   Future<void> _selectDatabasePath() async {
@@ -836,7 +847,7 @@ class _SettingsPageState extends State<SettingsPage> {
               title: '账号wxid',
               subtitle: _wxidController.text.trim().isNotEmpty
                   ? '已保存wxid，可手动修改或重新扫描'
-                  : '未找到账号目录，请手动输入wxid（如：wxid_abc123）',
+                  : '未找到账号目录，请手动输入账号标识',
               child: Column(
                 children: [
                   TextFormField(

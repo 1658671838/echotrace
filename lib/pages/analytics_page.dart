@@ -49,12 +49,32 @@ class _AnalyticsPageState extends State<AnalyticsPage> {
   Future<void> _loadData() async {
     await logger.debug('AnalyticsPage', '========== 开始加载数据分析 ==========');
 
+    if (mounted) {
+      setState(() {
+        _isLoading = true;
+        _loadingStatus = '正在连接数据库...';
+        _processedCount = 0;
+        _totalCount = 0;
+      });
+    }
+
     if (!widget.databaseService.isConnected) {
-      await logger.warning('AnalyticsPage', '数据库未连接');
+      await logger.warning('AnalyticsPage', '数据库未连接，尝试自动连接');
+      final appState = context.read<AppState>();
+      try {
+        await appState.reconnectDatabase();
+      } catch (e) {
+        await logger.error('AnalyticsPage', '自动连接失败', e);
+      }
+    }
+
+    if (!widget.databaseService.isConnected) {
+      await logger.warning('AnalyticsPage', '数据库仍未连接');
       if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text('请先连接数据库')));
+        setState(() {
+          _isLoading = false;
+          _loadingStatus = '数据库未连接';
+        });
       }
       return;
     }
@@ -375,11 +395,16 @@ class _AnalyticsPageState extends State<AnalyticsPage> {
           _buildHeader(),
           // 内容区域
           Expanded(
-            child: _isLoading
-                ? _buildLoadingView()
-                : _overallStats == null
-                ? _buildEmptyView()
-                : _buildContent(),
+            child: AnimatedSwitcher(
+              duration: const Duration(milliseconds: 240),
+              switchInCurve: Curves.easeOut,
+              switchOutCurve: Curves.easeIn,
+              child: _isLoading
+                  ? _buildLoadingView()
+                  : _overallStats == null
+                      ? _buildEmptyView()
+                      : _buildContent(),
+            ),
           ),
         ],
       ),

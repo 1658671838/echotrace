@@ -64,7 +64,7 @@ class Message {
 
   /// 从数据库Map创建Message对象
   factory Message.fromMap(Map<String, dynamic> map, {String? myWxid}) {
-    int _intValue(List<String> keys, {int defaultValue = 0}) {
+    int intValue(List<String> keys, {int defaultValue = 0}) {
       for (final key in keys) {
         if (map.containsKey(key) && map[key] != null) {
           final v = map[key];
@@ -77,7 +77,7 @@ class Message {
       return defaultValue;
     }
 
-    int? _nullableIntValue(List<String> keys) {
+    int? nullableIntValue(List<String> keys) {
       for (final key in keys) {
         if (map.containsKey(key) && map[key] != null) {
           final v = map[key];
@@ -90,7 +90,7 @@ class Message {
       return null;
     }
 
-    String _stringValue(List<String> keys) {
+    String stringValue(List<String> keys) {
       for (final key in keys) {
         if (map.containsKey(key) && map[key] != null) {
           return _safeStringFromMap(map, key);
@@ -99,8 +99,8 @@ class Message {
       return '';
     }
 
-    final localType = _intValue(['local_type', 'type', 'localType']);
-    final messageContent = _stringValue([
+    final localType = intValue(['local_type', 'type', 'localType']);
+    final messageContent = stringValue([
       'message_content',
       'WCDB_CT_message_content',
       'content',
@@ -108,7 +108,7 @@ class Message {
 
     // 步骤1：处理compress_content - 检查是否为blob格式
     String actualContent = '';
-    String _decodeMaybeCompressed(dynamic raw) {
+    String decodeMaybeCompressed(dynamic raw) {
       if (raw is Uint8List) {
         return _decodeBinaryContent(raw);
       }
@@ -137,9 +137,9 @@ class Message {
         map['WCDB_CT_compress_content'] ??
         map['WCDB_CT_message_content'];
 
-    actualContent = _decodeMaybeCompressed(compressContentRaw);
+    actualContent = decodeMaybeCompressed(compressContentRaw);
     if (actualContent.isEmpty && messageContent.isNotEmpty) {
-      actualContent = _decodeMaybeCompressed(messageContent);
+      actualContent = decodeMaybeCompressed(messageContent);
     }
 
     final senderUsername = _safeStringFromMap(map, 'sender_username');
@@ -154,7 +154,7 @@ class Message {
       myWxid,
       senderUsername: senderUsername.isEmpty ? null : senderUsername,
       senderDisplayName: senderDisplayName.isEmpty ? null : senderDisplayName,
-      isSendFlag: isSendVal ?? _nullableIntValue(['is_send', 'isSend']),
+      isSendFlag: isSendVal ?? nullableIntValue(['is_send', 'isSend']),
     );
 
     // 提取图片MD5（如果是图片消息）
@@ -182,18 +182,18 @@ class Message {
     }
 
     return Message(
-      localId: _intValue(['local_id']),
-      serverId: _intValue(['server_id']),
+      localId: intValue(['local_id']),
+      serverId: intValue(['server_id']),
       localType: localType,
-      sortSeq: _intValue(['sort_seq']),
-      realSenderId: _intValue(['real_sender_id']),
-      createTime: _intValue(['create_time']),
-      status: _intValue(['status']),
-      uploadStatus: _intValue(['upload_status']),
-      downloadStatus: _intValue(['download_status']),
-      serverSeq: _intValue(['server_seq']),
-      originSource: _intValue(['origin_source', 'WCDB_CT_source']),
-      source: _stringValue(['source', 'WCDB_CT_source']),
+      sortSeq: intValue(['sort_seq']),
+      realSenderId: intValue(['real_sender_id']),
+      createTime: intValue(['create_time']),
+      status: intValue(['status']),
+      uploadStatus: intValue(['upload_status']),
+      downloadStatus: intValue(['download_status']),
+      serverSeq: intValue(['server_seq']),
+      originSource: intValue(['origin_source', 'WCDB_CT_source']),
+      source: stringValue(['source', 'WCDB_CT_source']),
       messageContent: messageContent,
       compressContent: actualContent, // 存储解压后的内容
       packedInfoData: () {
@@ -256,6 +256,16 @@ class Message {
 
     if (isTargetMessage) {}
 
+    // 特殊处理：群聊置顶消息请求/响应，避免展示原始XML/CDATA
+    if (_looksLikeChatroomTopMessage(decodedContent)) {
+      final name = _preferredSenderName(
+        senderDisplayName,
+        senderUsername,
+        fallback: '群成员',
+      );
+      return '$name 置顶了一条消息';
+    }
+
     // 检查解码后的内容是否包含XML
     final hasXmlContent =
         decodedContent.contains('<') &&
@@ -290,9 +300,8 @@ class Message {
           return '[不支持的消息类型]';
         }
 
-        // 普通文本消息，移除wxid前缀
-        final wxidPattern = RegExp(r'^wxid_[a-zA-Z0-9]+:\s*');
-        return textContent.replaceFirst(wxidPattern, '');
+        // 普通文本消息，移除可能的账号前缀
+        return _stripSenderPrefix(textContent);
 
       case 3: // 图片消息
         return '[图片]';
@@ -419,9 +428,8 @@ class Message {
 
     // 非XML内容
     if (decodedContent.isNotEmpty) {
-      // 移除可能的wxid前缀
-      final wxidPattern = RegExp(r'^wxid_[a-zA-Z0-9]+:\s*');
-      final cleanContent = decodedContent.replaceFirst(wxidPattern, '');
+      // 移除可能的账号前缀
+      final cleanContent = _stripSenderPrefix(decodedContent);
       final result = cleanContent.isNotEmpty
           ? cleanContent
           : '[未知消息类型($localType)]';
@@ -452,6 +460,34 @@ class Message {
       out.add(v);
     }
     return out;
+  }
+
+  // 移除消息前面的“username: ”样式前缀，避免群聊显示原始id
+  static String _stripSenderPrefix(String input) {
+    if (input.isEmpty) return input;
+    final prefixPattern = RegExp(
+      r'^[\s\u00A0\u2000-\u200B\u202F\u205F\u3000]*([a-zA-Z0-9_-]+):\s*',
+    );
+    return input.replaceFirst(prefixPattern, '');
+  }
+
+  static bool _looksLikeChatroomTopMessage(String content) {
+    if (content.isEmpty) return false;
+    final lower = content.toLowerCase();
+    return lower.contains('chatroomtopmsgrequest') ||
+        lower.contains('chatroomtopmsgresponse');
+  }
+
+  static String _preferredSenderName(
+    String? displayName,
+    String? username, {
+    required String fallback,
+  }) {
+    final dn = displayName?.trim() ?? '';
+    if (dn.isNotEmpty) return dn;
+    final un = username?.trim() ?? '';
+    if (un.isNotEmpty) return un;
+    return fallback;
   }
 
   /// HTML实体解码
@@ -728,7 +764,6 @@ class Message {
     return null;
   }
 
-  // --- 在这里添加新的【静态】方法 ---
   // 这个方法可以直接通过类名调用：Message.getTypeDescriptionFromInt(1)
   static String getTypeDescriptionFromInt(int localType) {
     switch (localType) {
@@ -821,30 +856,30 @@ class Message {
     if (localType != 3) return '';
     final xml = compressContent.isNotEmpty ? compressContent : messageContent;
     if (xml.isEmpty) return '';
-    String _attr(String name) {
+    String attr(String name) {
       final match = RegExp('$name="([^"]+)"').firstMatch(xml);
       return match?.group(1) ?? '';
     }
 
-    String _short(String v, [int max = 80]) {
+    String short(String v, [int max = 80]) {
       if (v.isEmpty) return '';
       if (v.length <= max) return v;
       return '${v.substring(0, max)}...(${v.length})';
     }
 
     final items = <String>[];
-    final aesKey = _attr('aeskey');
-    final thumbKey = _attr('cdnthumbaeskey');
-    final midUrl = _attr('cdnmidimgurl');
-    final bigUrl = _attr('cdnbigimgurl');
-    final length = _attr('length');
-    final hdLength = _attr('hdlength');
-    final hevcSize = _attr('hevc_mid_size');
+    final aesKey = attr('aeskey');
+    final thumbKey = attr('cdnthumbaeskey');
+    final midUrl = attr('cdnmidimgurl');
+    final bigUrl = attr('cdnbigimgurl');
+    final length = attr('length');
+    final hdLength = attr('hdlength');
+    final hevcSize = attr('hevc_mid_size');
 
-    if (aesKey.isNotEmpty) items.add('aeskey=${_short(aesKey, 120)}');
-    if (thumbKey.isNotEmpty) items.add('thumbKey=${_short(thumbKey, 120)}');
-    if (midUrl.isNotEmpty) items.add('midUrl=${_short(midUrl)}');
-    if (bigUrl.isNotEmpty) items.add('bigUrl=${_short(bigUrl)}');
+    if (aesKey.isNotEmpty) items.add('aeskey=${short(aesKey, 120)}');
+    if (thumbKey.isNotEmpty) items.add('thumbKey=${short(thumbKey, 120)}');
+    if (midUrl.isNotEmpty) items.add('midUrl=${short(midUrl)}');
+    if (bigUrl.isNotEmpty) items.add('bigUrl=${short(bigUrl)}');
     if (length.isNotEmpty) items.add('len=$length');
     if (hdLength.isNotEmpty) items.add('hdlen=$hdLength');
     if (hevcSize.isNotEmpty) items.add('hevc=$hevcSize');
