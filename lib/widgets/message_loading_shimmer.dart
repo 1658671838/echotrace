@@ -8,6 +8,9 @@ class MessageLoadingShimmer extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return ListView.builder(
+      // 允许在嵌套滚动场景（如加载更多占位）下测量自身高度，避免无限约束导致的异常
+      shrinkWrap: true,
+      physics: const NeverScrollableScrollPhysics(),
       padding: const EdgeInsets.all(16),
       itemCount: 8,
       itemBuilder: (context, index) {

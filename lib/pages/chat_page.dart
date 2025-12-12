@@ -39,7 +39,7 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
   bool _isLoadingMoreMessages = false;
   bool _hasMoreMessages = true;
   int _currentOffset = 0;
-  final ScrollController _scrollController = ScrollController();
+  late ScrollController _scrollController;
   // 群聊成员姓名缓存（username -> displayName）
   Map<String, String> _senderDisplayNames = {};
   final Set<String> _messageKeys = {};
@@ -56,6 +56,7 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
   Timer? _searchDebounce;
   String _lastSearchQuery = '';
   StreamSubscription<void>? _dbChangeSubscription;
+  int _sessionLoadSeq = 0;
 
   // 搜索相关
   bool _isSearching = false;
@@ -82,7 +83,7 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
     _searchController.addListener(_onSearchChanged);
     _listenDatabaseChanges();
     _loadSessions();
-    _scrollController.addListener(_onScroll);
+    _scrollController = ScrollController()..addListener(_onScroll);
     _loadMyAvatar();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _ensureConnected();
@@ -92,7 +93,9 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
   @override
   void dispose() {
     _searchDebounce?.cancel();
-    _scrollController.dispose();
+    _scrollController
+      ..removeListener(_onScroll)
+      ..dispose();
     _refreshController.dispose();
     _searchAnimationController.dispose();
     _searchController.dispose();
@@ -490,6 +493,7 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
   }
 
   Future<void> _loadMessages(ChatSession session) async {
+    final loadId = ++_sessionLoadSeq;
     await logger.info(
       'ChatPage',
       '开始加载会话消息: ${session.username} (${session.displayName ?? "无显示名"})',
@@ -505,6 +509,7 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
       _messages = []; // 清空旧消息
       _lastInitialLoadTime = null; // 重置初次加载时间
       _prefetchScheduled = false;
+      _resetScrollController();
     });
 
     // 异步加载消息 - 初次只加载少量消息以提升性能
@@ -525,6 +530,16 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
       );
 
       if (!mounted) {
+        return;
+      }
+
+      // 如果用户已切换会话，丢弃结果
+      if (_sessionLoadSeq != loadId ||
+          _selectedSession?.username != session.username) {
+        await logger.info(
+          'ChatPage',
+          '会话已切换，丢弃旧的消息结果: ${session.username}',
+        );
         return;
       }
 
@@ -580,14 +595,35 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
       }
     } catch (e) {
       if (mounted) {
-        setState(() {
-          _isLoadingMessages = false;
-        });
+        if (_sessionLoadSeq == loadId) {
+          setState(() {
+            _isLoadingMessages = false;
+          });
+        }
         ScaffoldMessenger.of(
           context,
         ).showSnackBar(SnackBar(content: Text('加载消息失败: $e')));
       }
     }
+  }
+
+  void _resetScrollController() {
+    final oldController = _scrollController;
+    _scrollController = ScrollController()..addListener(_onScroll);
+    oldController.removeListener(_onScroll);
+    // 等待新列表构建完毕后再安全释放旧控制器，避免仍有附着的滚动位置导致报错
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && !oldController.hasClients) {
+        oldController.dispose();
+      } else {
+        // 再排队一次，确保彻底分离后释放
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!oldController.hasClients) {
+            oldController.dispose();
+          }
+        });
+      }
+    });
   }
 
   // 新增：专门加载群成员信息的方法
@@ -1086,130 +1122,120 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
                     ),
                     // 消息列表
                     Expanded(
-                      child: AnimatedSwitcher(
-                        duration: const Duration(milliseconds: 220),
-                        switchInCurve: Curves.easeOut,
-                        switchOutCurve: Curves.easeIn,
-                        transitionBuilder: (child, animation) {
-                          final slide = Tween<Offset>(
-                            begin: const Offset(0, 0.02),
-                            end: Offset.zero,
-                          ).animate(animation);
-                          return FadeTransition(
-                            opacity: animation,
-                            child: SlideTransition(
-                              position: slide,
-                              child: child,
+                      child: Stack(
+                        children: [
+                          Positioned.fill(
+                            child: AnimatedOpacity(
+                              duration: const Duration(milliseconds: 200),
+                              opacity: _isLoadingMessages ? 1 : 0,
+                              child: const IgnorePointer(
+                                child: MessageLoadingShimmer(
+                                  key: ValueKey('msg-loading'),
+                                ),
+                              ),
                             ),
-                          );
-                        },
-                        child: _isLoadingMessages
-                            ? const MessageLoadingShimmer(
-                                key: ValueKey('msg-loading'),
-                              )
-                            : _messages.isEmpty
-                                ? Center(
-                                    key: const ValueKey('msg-empty'),
-                                    child: Text(
-                                      '暂无消息',
-                                      style: Theme.of(context)
-                                          .textTheme
-                                          .bodyMedium
-                                          ?.copyWith(
-                                            color: Theme.of(context)
-                                                .colorScheme
-                                                .onSurface
-                                                .withValues(alpha: 0.5),
-                                          ),
-                                    ),
-                                  )
-                                : ListView.builder(
-                                    key: const ValueKey('msg-list'),
-                                    controller: _scrollController,
-                                    padding: const EdgeInsets.all(16),
-                                    cacheExtent: 800,
-                                    addAutomaticKeepAlives: false,
-                                    itemCount: _messages.length +
-                                        (_isLoadingMoreMessages ? 1 : 0),
-                                    itemBuilder: (context, index) {
-                                      // 顶部 loader
-                                      if (_isLoadingMoreMessages &&
-                                          index == 0) {
-                                        return const Padding(
-                                          padding:
-                                              EdgeInsets.only(bottom: 12),
-                                          child: MessageLoadingShimmer(),
+                          ),
+                          Positioned.fill(
+                            child: AnimatedOpacity(
+                              duration: const Duration(milliseconds: 220),
+                              opacity: _isLoadingMessages ? 0 : 1,
+                              child: _messages.isEmpty
+                                  ? Center(
+                                      child: Text(
+                                        '暂无消息',
+                                        style: Theme.of(context)
+                                            .textTheme
+                                            .bodyMedium
+                                            ?.copyWith(
+                                              color: Theme.of(context)
+                                                  .colorScheme
+                                                  .onSurface
+                                                  .withValues(alpha: 0.5),
+                                            ),
+                                      ),
+                                    )
+                                  : ListView.builder(
+                                      controller: _scrollController,
+                                      padding: const EdgeInsets.all(16),
+                                      cacheExtent: 800,
+                                      addAutomaticKeepAlives: false,
+                                      itemCount: _messages.length +
+                                          (_isLoadingMoreMessages ? 1 : 0),
+                                      itemBuilder: (context, index) {
+                                        if (_isLoadingMoreMessages &&
+                                            index == 0) {
+                                          return const Padding(
+                                            padding:
+                                                EdgeInsets.only(bottom: 12),
+                                            child: MessageLoadingShimmer(),
+                                          );
+                                        }
+
+                                        final offset =
+                                            _isLoadingMoreMessages ? 1 : 0;
+                                        final message =
+                                            _messages[index - offset];
+
+                                        final senderName =
+                                            _getSenderDisplayName(message);
+
+                                        bool shouldShowTime = false;
+                                        if (index - offset == 0) {
+                                          shouldShowTime = true;
+                                        } else {
+                                          final previousMessage =
+                                              _messages[index - offset - 1];
+                                          final timeDiff =
+                                              message.createTime -
+                                                  previousMessage.createTime;
+                                          shouldShowTime = timeDiff > 600;
+                                        }
+
+                                        final avatarUrl =
+                                            _selectedSession?.isGroup == true
+                                                ? (message.senderUsername != null
+                                                    ? appState.getAvatarUrl(
+                                                        message.senderUsername!,
+                                                      )
+                                                    : null)
+                                                : appState.getAvatarUrl(
+                                                    _selectedSession!.username,
+                                                  );
+
+                                        final avatarOwner = _isMessageFromMe(
+                                          message,
+                                        )
+                                            ? appState.databaseService
+                                                    .currentAccountWxid ??
+                                                ''
+                                            : (message.senderUsername ??
+                                                _selectedSession?.username ??
+                                                '');
+                                        final animateAvatar =
+                                            _shouldAnimateAvatar(
+                                          avatarOwner,
+                                          appState,
                                         );
-                                      }
 
-                                      final offset =
-                                          _isLoadingMoreMessages ? 1 : 0;
-                                      final message =
-                                          _messages[index - offset];
-
-                                      // 使用统一的方法获取发送者显示名
-                                      final senderName = _getSenderDisplayName(
-                                        message,
-                                      );
-
-                                      // 判断是否需要显示时间分隔符
-                                      bool shouldShowTime = false;
-                                      if (index - offset == 0) {
-                                        // 第一条消息总是显示时间
-                                        shouldShowTime = true;
-                                      } else {
-                                        final previousMessage =
-                                            _messages[index - offset - 1];
-                                        final timeDiff = message.createTime -
-                                            previousMessage.createTime;
-                                        // 如果时间间隔超过10分钟（600秒），显示时间分隔符
-                                        shouldShowTime = timeDiff > 600;
-                                      }
-
-                                      // 选择头像：
-                                      // 私聊：使用会话头像；群聊：使用发送者头像
-                                      final avatarUrl =
-                                          _selectedSession?.isGroup == true
-                                              ? (message.senderUsername != null
-                                                  ? appState.getAvatarUrl(
-                                                      message.senderUsername!,
-                                                    )
-                                                  : null)
-                                              : appState.getAvatarUrl(
-                                                  _selectedSession!.username,
-                                                );
-
-                                      final avatarOwner = _isMessageFromMe(
-                                        message,
-                                      )
-                                          ? appState.databaseService
-                                                  .currentAccountWxid ??
-                                              ''
-                                          : (message.senderUsername ??
-                                              _selectedSession?.username ??
-                                              '');
-                                      final animateAvatar =
-                                          _shouldAnimateAvatar(
-                                        avatarOwner,
-                                        appState,
-                                      );
-
-                                      return MessageBubble(
-                                        key: ValueKey(
-                                            'msg-${message.localId}-${message.createTime}'),
-                                        message: message,
-                                        isFromMe: _isMessageFromMe(message),
-                                        senderDisplayName: senderName,
-                                        sessionUsername:
-                                            _selectedSession?.username ?? '',
-                                        shouldShowTime: shouldShowTime,
-                                        avatarUrl: _isMessageFromMe(message)
-                                            ? _myAvatarUrl
-                                            : avatarUrl,
-                                        enableAvatarFade: animateAvatar,
-                                      );
-                                    },
-                                  ),
+                                        return MessageBubble(
+                                          key: ValueKey(
+                                              'msg-${message.localId}-${message.createTime}'),
+                                          message: message,
+                                          isFromMe: _isMessageFromMe(message),
+                                          senderDisplayName: senderName,
+                                          sessionUsername:
+                                              _selectedSession?.username ?? '',
+                                          shouldShowTime: shouldShowTime,
+                                          avatarUrl: _isMessageFromMe(message)
+                                              ? _myAvatarUrl
+                                              : avatarUrl,
+                                          enableAvatarFade: animateAvatar,
+                                        );
+                                      },
+                                    ),
+                            ),
+                          ),
+                        ],
                       ),
                     ),
                   ],
