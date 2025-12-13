@@ -25,16 +25,30 @@ jobs:
       - run: flutter pub get
       - run: flutter build windows --release
 
-      - name: Package
+      - name: Build zip
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}"
           $src = "build/windows/x64/runner/Release"
           $zip = "echotrace-windows-$tag.zip"
-          if (!(Test-Path $src)) { dir build/windows -Recurse; throw "Build output not found: $src" }
+          if (!(Test-Path $src)) { dir build/windows -Recurse; throw "build output not found" }
           if (Test-Path $zip) { Remove-Item $zip -Force }
           Compress-Archive -Path "$src/*" -DestinationPath $zip -Force
           "ZIP_NAME=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build msix
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $v = $tag.TrimStart("v")
+          $msixVersion = "$v.0"
+          dart run msix:create --version $msixVersion
+          $out = Get-ChildItem -Recurse -Filter "*.msix" | Select-Object -First 1
+          if (!$out) { throw "msix not found" }
+          $name = "echotrace-windows-$tag.msix"
+          if (Test-Path $name) { Remove-Item $name -Force }
+          Move-Item $out.FullName $name
+          "MSIX_NAME=$name" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Build release body
         uses: actions/github-script@v7
@@ -42,70 +56,37 @@ jobs:
           script: |
             const { execSync } = require("child_process");
             const fs = require("fs");
-
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const tagName = context.ref.replace("refs/tags/", "");
-
+            const tag = context.ref.replace("refs/tags/", "");
             const tags = execSync("git tag --sort=-creatordate").toString().trim().split("\n").filter(Boolean);
-            const idx = tags.indexOf(tagName);
-            const prevTag = (idx >= 0 && idx + 1 < tags.length) ? tags[idx + 1] : null;
-
-            let generated = "";
-            try {
-              const resp = await github.request("POST /repos/{owner}/{repo}/releases/generate-notes", {
-                owner,
-                repo,
-                tag_name: tagName,
-                previous_tag_name: prevTag || undefined
-              });
-              generated = resp.data.body || "";
-            } catch (e) {
-              core.warning(`generate-notes failed: ${e}`);
-              generated = `## Changes\n\n`;
-            }
-
-            const headDate = execSync(`git show -s --format=%cI ${tagName}`).toString().trim();
-            const baseDate = prevTag ? execSync(`git show -s --format=%cI ${prevTag}`).toString().trim() : null;
-
-            let prsSection = "## Pull Requests\n";
-            if (baseDate) {
-              const q = `repo:${owner}/${repo} is:pr is:merged merged:${baseDate}..${headDate}`;
-              const prResp = await github.rest.search.issuesAndPullRequests({ q, per_page: 100 });
-              const prs = prResp.data.items || [];
-              if (prs.length) {
-                prsSection += prs.map(pr => `- ${pr.title} (#${pr.number}) ${pr.html_url}`).join("\n") + "\n";
-              } else {
-                prsSection += "- (none)\n";
-              }
-            } else {
-              prsSection += "- (no previous tag)\n";
-            }
-
-            let commitsSection = "## Commits\n";
-            if (prevTag) {
+            const idx = tags.indexOf(tag);
+            const prev = idx >= 0 && idx + 1 < tags.length ? tags[idx + 1] : null;
+            const gen = await github.request("POST /repos/{owner}/{repo}/releases/generate-notes", {
+              owner,
+              repo,
+              tag_name: tag,
+              previous_tag_name: prev || undefined
+            });
+            let body = gen.data.body || "";
+            if (prev) {
               const cmp = await github.request("GET /repos/{owner}/{repo}/compare/{base}...{head}", {
                 owner,
                 repo,
-                base: prevTag,
-                head: tagName
+                base: prev,
+                head: tag
               });
-              const commits = cmp.data.commits || [];
-              if (commits.length) {
-                commitsSection += commits.map(c => `- ${c.commit.message.split("\n")[0]} (${c.sha.substring(0,7)}) ${c.html_url}`).join("\n") + "\n";
-              } else {
-                commitsSection += "- (none)\n";
-              }
-            } else {
-              const log = execSync(`git log ${tagName} --pretty=format:"- %s (%h)" -n 50`).toString().trim();
-              commitsSection += (log ? log + "\n" : "- (none)\n");
+              body += "\n\n---\n\n## Commits\n";
+              body += (cmp.data.commits || [])
+                .map(c => `- ${c.commit.message.split("\n")[0]} (${c.sha.slice(0,7)}) ${c.html_url}`)
+                .join("\n");
             }
-
-            const body = `${generated}\n\n---\n\n${prsSection}\n${commitsSection}`;
             fs.writeFileSync("RELEASE_NOTES.md", body);
 
-      - name: Create release and upload asset
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           body_path: RELEASE_NOTES.md
-          files: ${{ env.ZIP_NAME }}
+          files: |
+            ${{ env.ZIP_NAME }}
+            ${{ env.MSIX_NAME }}
