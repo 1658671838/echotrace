@@ -64,6 +64,8 @@ class _DataManagementPageState extends State<DataManagementPage>
   String _currentDecryptingImage = '';
   final Map<String, bool> _imageDecryptResults = {}; // 记录每个图片的解密结果
   final Map<String, String> _tableDisplayNameCache = {}; // Msg表哈希 -> 显示名
+  final TextEditingController _imageSearchController = TextEditingController();
+  String _imageNameQuery = '';
 
   @override
   void initState() {
@@ -80,6 +82,7 @@ class _DataManagementPageState extends State<DataManagementPage>
   void dispose() {
     _tabController.dispose();
     _decryptService.dispose();
+    _imageSearchController.dispose();
     super.dispose();
   }
 
@@ -1645,6 +1648,15 @@ class _DataManagementPageState extends State<DataManagementPage>
           .toList();
     }
 
+    // 应用文件名搜索
+    if (_imageNameQuery.trim().isNotEmpty) {
+      final query = _imageNameQuery.trim().toLowerCase();
+      filteredFiles = filteredFiles.where((f) {
+        return f.fileName.toLowerCase().contains(query) ||
+            f.relativePath.toLowerCase().contains(query);
+      }).toList();
+    }
+
     // 应用解密状态过滤
     if (_showOnlyUndecrypted) {
       filteredFiles = filteredFiles.where((f) => !f.isDecrypted).toList();
@@ -2821,6 +2833,15 @@ class _DataManagementPageState extends State<DataManagementPage>
           .toList();
     }
 
+    // 应用文件名搜索
+    if (_imageNameQuery.trim().isNotEmpty) {
+      final query = _imageNameQuery.trim().toLowerCase();
+      filteredFiles = filteredFiles.where((f) {
+        return f.fileName.toLowerCase().contains(query) ||
+            f.relativePath.toLowerCase().contains(query);
+      }).toList();
+    }
+
     // 应用解密状态过滤
     if (_showOnlyUndecrypted) {
       filteredFiles = filteredFiles.where((f) => !f.isDecrypted).toList();
@@ -2961,6 +2982,46 @@ class _DataManagementPageState extends State<DataManagementPage>
                       ),
                     );
                   }),
+                ],
+              ),
+              const SizedBox(height: 12),
+              // 第三行：文件名搜索
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _imageSearchController,
+                      decoration: InputDecoration(
+                        isDense: true,
+                        labelText: '按文件名搜索',
+                        hintText: '输入文件名或路径片段',
+                        prefixIcon: const Icon(Icons.search, size: 18),
+                        suffixIcon: _imageNameQuery.isNotEmpty
+                            ? IconButton(
+                                icon: const Icon(Icons.clear, size: 18),
+                                onPressed: () {
+                                  setState(() {
+                                    _imageNameQuery = '';
+                                    _imageSearchController.clear();
+                                  });
+                                },
+                              )
+                            : null,
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 10,
+                        ),
+                      ),
+                      onChanged: (value) {
+                        setState(() {
+                          _imageNameQuery = value;
+                        });
+                      },
+                    ),
+                  ),
                 ],
               ),
             ],

@@ -25,6 +25,9 @@ EchoTrace 是一个**完全本地**的微信聊天记录导出、分析与年度
 </a>
 </p>
 
+> [!TIP]
+> 如果导出聊天记录后，想深入分析聊天内容可以试试 [@hellodigua](https://github.com/hellodigua) 的 [ChatLab](https://chatlab.fun/)
+
 ##  EchoTrace 为何而来
 
 我想知道，这些年来，时间都带我遇见了谁，又留下了些什么

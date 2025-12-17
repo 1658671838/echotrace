@@ -865,7 +865,39 @@ class Message {
   bool get isCompressed => compressContent.isNotEmpty;
 
   /// 是否为图片消息（暂时禁用图片显示，改为文本）
-  bool get hasImage => false;
+  bool get hasImage => isImageMessage;
+
+  /// 从 packed_info_data 提取图片文件名（不含扩展名）
+  /// 例如 packed_info_data 中包含 ...3848xxxx.dat，则返回 3848xxxx
+  String? get imageDatName {
+    if (localType != 3 || packedInfoData.isEmpty) return null;
+
+    // 仅提取可打印字符，方便匹配
+    final printable = StringBuffer();
+    for (final b in packedInfoData) {
+      if (b >= 0x20 && b <= 0x7E) {
+        printable.writeCharCode(b);
+      } else {
+        printable.write(' ');
+      }
+    }
+    final text = printable.toString();
+
+    // 优先匹配形如 abc.t.dat / abc.dat
+    final datMatch =
+        RegExp(r'([0-9a-fA-F]{8,})(?:\\.t)?\\.dat').firstMatch(text);
+    if (datMatch != null) {
+      return datMatch.group(1)!.toLowerCase();
+    }
+
+    // 退化：匹配长的 hex 字符串
+    final hexMatch = RegExp(r'([0-9a-fA-F]{16,})').firstMatch(text);
+    if (hexMatch != null) {
+      return hexMatch.group(1)!.toLowerCase();
+    }
+
+    return null;
+  }
 
   /// 图片消息调试信息（便于日志查看）
   String get imageDebugInfo {

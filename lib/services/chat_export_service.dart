@@ -15,6 +15,7 @@ import 'logger_service.dart';
 class ChatExportService {
   final DatabaseService _databaseService;
   final Set<String> _missingDisplayNameLog = <String>{};
+  final Map<String, String> _avatarBase64CacheByUrl = <String, String>{};
   static final RegExp _invalidXmlChars = RegExp(
     r'[\x00-\x08\x0B\x0C\x0E-\x1F]',
   );
@@ -56,6 +57,14 @@ class ChatExportService {
           ? await _getContactInfo(rawMyWxid)
           : <String, String>{};
       final myDisplayName = await _buildMyDisplayName(rawMyWxid, myContactInfo);
+      final avatars = await _buildAvatarIndex(
+        session: session,
+        messages: messages,
+        contactInfo: contactInfo,
+        senderDisplayNames: senderDisplayNames,
+        rawMyWxid: rawMyWxid,
+        myDisplayName: myDisplayName,
+      );
 
       final messageItems = messages.map((msg) {
         final isSend = msg.isSend == 1;
@@ -85,6 +94,7 @@ class ChatExportService {
           'isSend': msg.isSend,
           'senderUsername': senderWxid.isEmpty ? null : senderWxid,
           'senderDisplayName': senderName,
+          'senderAvatarKey': senderWxid.isEmpty ? null : senderWxid,
           'source': msg.source,
         };
       }).toList();
@@ -103,6 +113,7 @@ class ChatExportService {
           'messageCount': messages.length,
         },
         'messages': messageItems,
+        'avatars': avatars,
         'exportTime': DateTime.now().toIso8601String(),
       };
 
@@ -169,6 +180,14 @@ class ChatExportService {
           ? await _getContactInfo(rawMyWxid)
           : <String, String>{};
       final myDisplayName = await _buildMyDisplayName(rawMyWxid, myContactInfo);
+      final avatars = await _buildAvatarIndex(
+        session: session,
+        messages: messages,
+        contactInfo: contactInfo,
+        senderDisplayNames: senderDisplayNames,
+        rawMyWxid: rawMyWxid,
+        myDisplayName: myDisplayName,
+      );
 
       final html = _generateHtml(
         session,
@@ -176,8 +195,8 @@ class ChatExportService {
         senderDisplayNames,
         myWxid,
         contactInfo,
-        myContactInfo,
         myDisplayName,
+        avatars,
       );
 
       if (filePath == null) {
@@ -288,6 +307,14 @@ class ChatExportService {
         rawAccountWxid,
         currentAccountInfo,
       );
+      final avatars = await _buildAvatarIndex(
+        session: session,
+        messages: messages,
+        contactInfo: contactInfo,
+        senderDisplayNames: senderDisplayNames,
+        rawMyWxid: rawAccountWxid,
+        myDisplayName: myDisplayName,
+      );
       final sanitizedAccountWxid = currentAccountWxid;
       if (sanitizedAccountWxid.isNotEmpty) {
         senderContactInfos[sanitizedAccountWxid] = currentAccountInfo;
@@ -350,6 +377,28 @@ class ChatExportService {
       sheet.getRangeByIndex(1, 6).columnWidth = 18; // 发送者身份
       sheet.getRangeByIndex(1, 7).columnWidth = 12; // 消息类型
       sheet.getRangeByIndex(1, 8).columnWidth = 50; // 内容
+
+      if (avatars.isNotEmpty) {
+        final avatarSheet = workbook.worksheets.addWithName('头像索引');
+        _setTextSafe(avatarSheet, 1, 1, '头像ID');
+        _setTextSafe(avatarSheet, 1, 2, '显示名称');
+        _setTextSafe(avatarSheet, 1, 3, 'Base64');
+        int avatarRow = 2;
+        avatars.forEach((key, meta) {
+          _setTextSafe(avatarSheet, avatarRow, 1, key);
+          _setTextSafe(
+            avatarSheet,
+            avatarRow,
+            2,
+            meta['displayName'] ?? key,
+          );
+          _setTextSafe(avatarSheet, avatarRow, 3, meta['base64'] ?? '');
+          avatarRow++;
+        });
+        avatarSheet.getRangeByIndex(1, 1).columnWidth = 18;
+        avatarSheet.getRangeByIndex(1, 2).columnWidth = 24;
+        avatarSheet.getRangeByIndex(1, 3).columnWidth = 80;
+      }
 
       if (filePath == null) {
         final suggestedName =
@@ -526,8 +575,8 @@ class ChatExportService {
     Map<String, String> senderDisplayNames,
     String myWxid,
     Map<String, String> contactInfo,
-    Map<String, String> myContactInfo,
     String myDisplayName,
+    Map<String, Map<String, String>> avatarIndex,
   ) {
     final buffer = StringBuffer();
 
@@ -549,6 +598,12 @@ class ChatExportService {
       } else {
         senderName = myDisplayName;
       }
+      final avatarKey = _resolveSenderUsername(
+        msg: msg,
+        session: session,
+        isSend: isSend,
+        myWxid: myWxid,
+      );
 
       return {
         'date':
@@ -559,6 +614,7 @@ class ChatExportService {
         'content': msg.displayContent,
         'senderName': senderName,
         'timestamp': msg.createTime,
+        'avatarKey': avatarKey.isEmpty ? null : avatarKey,
       };
     }).toList();
 
@@ -659,6 +715,7 @@ class ChatExportService {
     // 将消息数据嵌入为JSON
     buffer.writeln('  <script>');
     buffer.writeln('    const messagesData = ${jsonEncode(messagesData)};');
+    buffer.writeln('    const avatarIndex = ${jsonEncode(avatarIndex)};');
     buffer.writeln('    const INITIAL_BATCH = 100; // 首次加载最新100条');
     buffer.writeln('    const BATCH_SIZE = 200; // 后续每批200条');
     buffer.writeln('    let loadedStart = messagesData.length; // 从末尾开始加载');
@@ -859,6 +916,141 @@ class ChatExportService {
     buffer.writeln('</html>');
 
     return buffer.toString();
+  }
+
+  Future<Map<String, Map<String, String>>> _buildAvatarIndex({
+    required ChatSession session,
+    required List<Message> messages,
+    required Map<String, String> contactInfo,
+    required Map<String, String> senderDisplayNames,
+    required String rawMyWxid,
+    required String myDisplayName,
+  }) async {
+    final targets = <String>{
+      session.username,
+      rawMyWxid,
+      ...messages
+          .map((m) => m.senderUsername)
+          .whereType<String>(),
+    }..removeWhere((u) => u.trim().isEmpty);
+
+    if (targets.isEmpty) return {};
+
+    final avatarUrls = await _databaseService.getAvatarUrls(targets.toList());
+    if (avatarUrls.isEmpty) {
+      return {};
+    }
+
+    final base64ByKey = <String, String>{};
+    for (final entry in avatarUrls.entries) {
+      final key = _sanitizeUsername(entry.key);
+      if (key.isEmpty) continue;
+      final encoded = await _loadAvatarBase64(entry.value);
+      if (encoded != null && encoded.isNotEmpty) {
+        base64ByKey[key] = encoded;
+      }
+    }
+
+    if (base64ByKey.isEmpty) {
+      return {};
+    }
+
+    final nameByKey = <String, String>{};
+    void assignName(String username, String value) {
+      final key = _sanitizeUsername(username);
+      if (key.isEmpty || nameByKey.containsKey(key)) return;
+      final trimmed = value.trim();
+      nameByKey[key] = trimmed.isEmpty ? key : trimmed;
+    }
+
+    assignName(
+      session.username,
+      _resolvePreferredName(
+        contactInfo,
+        fallback: session.displayName ?? session.username,
+      ),
+    );
+    if (rawMyWxid.trim().isNotEmpty) {
+      assignName(rawMyWxid, myDisplayName);
+    }
+    senderDisplayNames.forEach((username, display) {
+      assignName(username, display);
+    });
+    base64ByKey.keys.where((key) => !nameByKey.containsKey(key)).forEach(
+      (key) => nameByKey[key] = key,
+    );
+
+    final merged = <String, Map<String, String>>{};
+    base64ByKey.forEach((key, value) {
+      merged[key] = {
+        'displayName': nameByKey[key] ?? key,
+        'base64': value,
+      };
+    });
+
+    return merged;
+  }
+
+  Future<String?> _loadAvatarBase64(String url) async {
+    final trimmed = url.trim();
+    if (trimmed.isEmpty) return null;
+
+    final cached = _avatarBase64CacheByUrl[trimmed];
+    if (cached != null) return cached;
+
+    if (trimmed.startsWith('data:')) {
+      final parts = trimmed.split(',');
+      if (parts.length >= 2) {
+        final payload = parts.sublist(1).join(',');
+        _avatarBase64CacheByUrl[trimmed] = payload;
+        return payload;
+      }
+    }
+
+    final resolvedPath =
+        trimmed.startsWith('file://') ? PathUtils.fromUri(trimmed) : trimmed;
+    try {
+      final file = File(resolvedPath);
+      if (await file.exists()) {
+        final bytes = await file.readAsBytes();
+        final encoded = base64Encode(bytes);
+        _avatarBase64CacheByUrl[trimmed] = encoded;
+        return encoded;
+      }
+    } catch (_) {}
+
+    if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+      HttpClient? client;
+      try {
+        final uri = Uri.parse(trimmed);
+        client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
+        final request = await client.getUrl(uri).timeout(
+              const Duration(seconds: 10),
+            );
+        final response = await request.close().timeout(
+              const Duration(seconds: 12),
+            );
+        if (response.statusCode == 200) {
+          final builder = BytesBuilder();
+          await for (final chunk in response) {
+            builder.add(chunk);
+          }
+          final bytes = builder.takeBytes();
+          if (bytes.isNotEmpty) {
+            final encoded = base64Encode(bytes);
+            _avatarBase64CacheByUrl[trimmed] = encoded;
+            return encoded;
+          }
+        }
+      } catch (_) {
+        // 忽略远程获取错误，继续返回空字符串
+      } finally {
+        client?.close(force: true);
+      }
+    }
+
+    _avatarBase64CacheByUrl[trimmed] = '';
+    return '';
   }
 
   String _sanitizeForExcel(String? value) {

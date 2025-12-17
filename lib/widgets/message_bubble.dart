@@ -250,6 +250,7 @@ class _MessageBubbleState extends State<MessageBubble> {
                 ? ImageMessageWidget(
                     message: widget.message,
                     sessionUsername: widget.sessionUsername,
+                    isFromMe: true,
                   )
                 : Container(
                     padding: const EdgeInsets.all(12),
@@ -413,6 +414,7 @@ class _MessageBubbleState extends State<MessageBubble> {
                 ? ImageMessageWidget(
                     message: widget.message,
                     sessionUsername: widget.sessionUsername,
+                    isFromMe: false,
                   )
                 : Container(
                     padding: const EdgeInsets.all(12),
