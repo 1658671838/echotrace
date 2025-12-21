@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
@@ -8,7 +9,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../providers/app_state.dart';
 import '../models/chat_session.dart';
 import '../models/contact_record.dart';
+import '../models/message.dart';
 import '../services/chat_export_service.dart';
+import '../services/database_service.dart';
 import '../widgets/common/shimmer_loading.dart';
 import '../utils/string_utils.dart';
 
@@ -29,6 +32,9 @@ class _ChatExportPageState extends State<ChatExportPage> {
   String _selectedFormat = 'json';
   DateTimeRange? _selectedRange;
   String? _exportFolder;
+  bool _isAutoConnecting = false;
+  bool _autoLoadScheduled = false;
+  bool _hasAttemptedRefreshAfterConnect = false;
   bool _useAllTime = false;
   bool _isExportingContacts = false;
 
@@ -45,6 +51,9 @@ class _ChatExportPageState extends State<ChatExportPage> {
       start: DateTime.now().subtract(const Duration(days: 7)),
       end: DateTime.now(),
     );
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _ensureConnected();
+    });
   }
 
   Future<void> _loadExportFolder() async {
@@ -162,6 +171,39 @@ class _ChatExportPageState extends State<ChatExportPage> {
         setState(() {
           _isExportingContacts = false;
         });
+      }
+    }
+  }
+
+  Future<void> _ensureConnected() async {
+    final appState = context.read<AppState>();
+    if (!appState.isConfigured) return;
+    if (appState.databaseService.isConnected || appState.isLoading) return;
+    if (_isAutoConnecting) return;
+
+    setState(() {
+      _isAutoConnecting = true;
+      _hasAttemptedRefreshAfterConnect = false;
+    });
+    try {
+      await appState.reconnectDatabase();
+      if (mounted) {
+        await _loadSessions();
+        _hasAttemptedRefreshAfterConnect = true;
+      }
+    } catch (_) {
+      // 失败交给 UI 提示
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isAutoConnecting = false;
+        });
+        // 若仍未连接，再尝试一次刷新会话列表以防遗漏
+        if (!_hasAttemptedRefreshAfterConnect &&
+            appState.databaseService.isConnected) {
+          _hasAttemptedRefreshAfterConnect = true;
+          unawaited(_loadSessions());
+        }
       }
     }
   }
@@ -391,20 +433,238 @@ class _ChatExportPageState extends State<ChatExportPage> {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      color: Theme.of(context).colorScheme.surface,
-      child: Column(
+    final appState = context.watch<AppState>();
+    final hasError = appState.errorMessage != null;
+    final isConnecting =
+        appState.isLoading ||
+        _isAutoConnecting ||
+        (!appState.databaseService.isConnected && !hasError);
+    final showErrorOverlay =
+        !appState.isLoading &&
+        !appState.databaseService.isConnected &&
+        hasError;
+
+    if (!isConnecting &&
+        !_isLoadingSessions &&
+        _allSessions.isEmpty &&
+        !_autoLoadScheduled &&
+        appState.databaseService.isConnected) {
+      _autoLoadScheduled = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        if (!mounted) return;
+        _autoLoadScheduled = false;
+        await _loadSessions();
+      });
+    }
+
+    return Scaffold(
+      backgroundColor: Colors.grey.shade50,
+      body: Stack(
         children: [
-          _buildHeader(),
-          _buildFilterBar(),
-          Expanded(
-            child: Row(
-              children: [
-                Expanded(flex: 2, child: _buildSessionList()),
-                Container(width: 1, color: Colors.grey.withValues(alpha: 0.2)),
-                Expanded(flex: 1, child: _buildExportSettings()),
-              ],
+          // 主内容
+          Column(
+            children: [
+              _buildHeader(),
+              _buildFilterBar(),
+              Expanded(
+                child: Row(
+                  children: [
+                    Expanded(flex: 2, child: _buildSessionList()),
+                    Container(
+                      width: 1,
+                      color: Colors.grey.withValues(alpha: 0.2),
+                    ),
+                    Expanded(flex: 1, child: _buildExportSettings()),
+                  ],
+                ),
+              ),
+            ],
+          ),
+
+          // 遮罩层 (加载/错误)
+          Positioned.fill(
+            child: AnimatedSwitcher(
+              duration: const Duration(milliseconds: 500),
+              switchInCurve: Curves.easeInOutCubic,
+              switchOutCurve: Curves.easeInOutCubic,
+              transitionBuilder: (child, animation) {
+                // 出入场动画
+                return FadeTransition(
+                  opacity: animation,
+                  child: ScaleTransition(
+                    scale: animation.drive(
+                      Tween<double>(
+                        begin: 0.96,
+                        end: 1.0,
+                      ).chain(CurveTween(curve: Curves.easeOutCubic)),
+                    ),
+                    child: child,
+                  ),
+                );
+              },
+              child: showErrorOverlay
+                  ? Container(
+                      key: const ValueKey('error_overlay'),
+                      color: Colors.white,
+                      child: Center(
+                        child: _buildErrorOverlay(
+                          context,
+                          appState,
+                          appState.errorMessage ?? '未能连接数据库',
+                        ),
+                      ),
+                    )
+                  : isConnecting
+                  ? Container(
+                      key: const ValueKey('loading_overlay'),
+                      color: Colors.white.withValues(alpha: 0.98),
+                      child: Center(child: _buildFancyLoader(context)),
+                    )
+                  : const SizedBox.shrink(key: ValueKey('none')),
             ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFancyLoader(BuildContext context) {
+    final color = Theme.of(context).colorScheme.primary;
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 800),
+      curve: Curves.elasticOut,
+      builder: (context, value, child) {
+        return Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              width: 80,
+              height: 40,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                children: List.generate(4, (index) {
+                  return _AnimatedBar(
+                    index: index,
+                    color: color,
+                    baseHeight: 12,
+                    maxExtraHeight: 24,
+                  );
+                }),
+              ),
+            ),
+            const SizedBox(height: 20),
+            Text(
+              '正在建立连接...',
+              style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                color: Theme.of(
+                  context,
+                ).colorScheme.onSurface.withValues(alpha: 0.7),
+                letterSpacing: 1.2,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildErrorOverlay(
+    BuildContext context,
+    AppState appState,
+    String message,
+  ) {
+    final theme = Theme.of(context);
+    final lower = message.toLowerCase();
+    bool isMissingDb =
+        lower.contains('未找到') ||
+        lower.contains('不存在') ||
+        lower.contains('no such file') ||
+        lower.contains('not found');
+
+    return Container(
+      constraints: const BoxConstraints(maxWidth: 400),
+      padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 32),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surface,
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(
+          color: theme.colorScheme.error.withValues(alpha: 0.1),
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.05),
+            blurRadius: 20,
+            offset: const Offset(0, 10),
+          ),
+        ],
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: theme.colorScheme.error.withValues(alpha: 0.1),
+              shape: BoxShape.circle,
+            ),
+            child: Icon(
+              Icons.error_outline_rounded,
+              size: 40,
+              color: theme.colorScheme.error,
+            ),
+          ),
+          const SizedBox(height: 20),
+          Text(
+            isMissingDb ? '未找到数据库文件' : '数据库连接异常',
+            style: theme.textTheme.titleMedium?.copyWith(
+              fontWeight: FontWeight.w800,
+              color: theme.colorScheme.error,
+            ),
+          ),
+          const SizedBox(height: 12),
+          Text(
+            isMissingDb ? '请先在「数据管理」页面解密对应账号的数据库。' : message,
+            textAlign: TextAlign.center,
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: theme.colorScheme.onSurface.withValues(alpha: 0.6),
+              height: 1.5,
+            ),
+          ),
+          const SizedBox(height: 28),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              ElevatedButton(
+                onPressed: () =>
+                    context.read<AppState>().setCurrentPage('data_management'),
+                style: ElevatedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 20,
+                    vertical: 12,
+                  ),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+                child: const Text('前往管理'),
+              ),
+              const SizedBox(width: 12),
+              OutlinedButton(
+                onPressed: _ensureConnected,
+                style: OutlinedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 20,
+                    vertical: 12,
+                  ),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+                child: const Text('重试'),
+              ),
+            ],
           ),
         ],
       ),
@@ -813,14 +1073,18 @@ class _ChatExportPageState extends State<ChatExportPage> {
                   _buildFormatOption('json', 'JSON', '结构化数据格式，便于程序处理'),
                   _buildFormatOption('html', 'HTML', '网页格式，便于浏览和分享'),
                   _buildFormatOption('xlsx', 'Excel', '表格格式，便于数据分析'),
-                  _buildFormatOption('sql', 'PostgreSQL', '数据库格式，便于导入到 PostgreSQL 数据库中'),
+                  _buildFormatOption(
+                    'sql',
+                    'PostgreSQL',
+                    '数据库格式，便于导入到 PostgreSQL 数据库中',
+                  ),
                   const SizedBox(height: 24),
                 ],
               ),
             ),
           ),
 
-          // 导出按钮（固定在底部）
+          // 导出按钮
           Padding(
             padding: const EdgeInsets.all(24),
             child: SizedBox(
@@ -903,7 +1167,9 @@ class _ChatExportPageState extends State<ChatExportPage> {
   }
 }
 
-/// 导出进度对话框
+// 导出状态枚举
+enum _ExportStatus { idle, initializing, exporting, completed, error }
+
 class _ExportProgressDialog extends StatefulWidget {
   final List<String> sessions;
   final List<ChatSession> allSessions;
@@ -926,296 +1192,577 @@ class _ExportProgressDialog extends StatefulWidget {
 }
 
 class _ExportProgressDialogState extends State<_ExportProgressDialog> {
-  int _currentIndex = 0;
   int _successCount = 0;
   int _failedCount = 0;
-  bool _isCompleted = false;
-  String _currentSessionName = '';
-  int _currentMessageCount = 0;
   int _totalMessagesProcessed = 0;
-  final List<String> _failedSessions = [];
+  int _currentExportedCount = 0;
+  String _currentSessionName = '';
+  double _progress = 0.0;
+  _ExportStatus _status = _ExportStatus.idle;
+  String? _errorMessage;
+  late int _totalSessions;
 
   @override
   void initState() {
     super.initState();
+    _totalSessions = widget.sessions.length;
     _startExport();
   }
 
+  @override
+  void dispose() {
+    super.dispose();
+  }
+
   Future<void> _startExport() async {
-    final appState = context.read<AppState>();
-    final databaseService = appState.databaseService;
+    try {
+      final appState = context.read<AppState>();
+      final dbService = appState.databaseService;
+      final exportService = ChatExportService(dbService);
 
-    // 计算时间戳
-    int startTimestamp;
-    int endTimestamp;
-
-    if (widget.useAllTime) {
-      startTimestamp = 0; // 从最早开始
-      endTimestamp = DateTime.now().millisecondsSinceEpoch ~/ 1000; // 到现在
-    } else {
-      startTimestamp =
-          widget.dateRange.start
-              .copyWith(hour: 0, minute: 0, second: 0)
-              .millisecondsSinceEpoch ~/
-          1000;
-      final endOfDay = DateTime(
-        widget.dateRange.end.year,
-        widget.dateRange.end.month,
-        widget.dateRange.end.day + 1,
-      ).subtract(const Duration(seconds: 1));
-      endTimestamp = endOfDay.millisecondsSinceEpoch ~/ 1000;
-    }
-
-    for (int i = 0; i < widget.sessions.length; i++) {
-      final username = widget.sessions[i];
-      final session = widget.allSessions.firstWhere(
-        (s) => s.username == username,
-      );
+      if (dbService.mode == DatabaseMode.realtime) {
+        throw Exception('实时模式暂不支持导出功能，切换至备份模式后重试。');
+      }
 
       setState(() {
-        _currentIndex = i;
-        _currentSessionName = session.displayName ?? session.username;
-        _currentMessageCount = 0;
+        _status = _ExportStatus.initializing;
       });
 
-      // 让UI有机会更新
-      await Future.delayed(const Duration(milliseconds: 50));
+      final startTime = widget.useAllTime
+          ? null
+          : widget.dateRange.start.millisecondsSinceEpoch ~/ 1000;
+      final endTime = widget.useAllTime
+          ? null
+          : widget.dateRange.end.millisecondsSinceEpoch ~/ 1000;
 
-      try {
-        // 获取消息
-        final messages = await databaseService.getMessagesByDate(
-          username,
-          startTimestamp,
-          endTimestamp,
-        );
+      // 提前获取所有会话，避免循环中重复调用
+      final sessions = await dbService.getSessions();
 
+      for (int i = 0; i < _totalSessions; i++) {
+        final username = widget.sessions[i];
+
+        // 尝试获取显示名称：Map(UI传入) > rcontact(数据库) > chat_session(数据库) > username
+        final sFromAll = widget.allSessions
+            .where((s) => s.username == username)
+            .firstOrNull;
+        String displayName = sFromAll?.displayName ?? username;
+
+        try {
+          final contact = await dbService.getContact(username);
+          if (contact != null) {
+            displayName = contact.displayName;
+          } else if (displayName == username) {
+            final s = sessions.where((s) => s.username == username).firstOrNull;
+            if (s != null &&
+                s.displayName != null &&
+                s.displayName != username &&
+                s.displayName!.isNotEmpty) {
+              displayName = s.displayName!;
+            }
+          }
+        } catch (_) {}
+
+        if (!mounted) return;
         setState(() {
-          _currentMessageCount = messages.length;
+          _status = _ExportStatus.exporting;
+          _progress = -1.0; // 扫描阶段显示不确定进度条
+          _currentSessionName = displayName;
+          _currentExportedCount = 0;
         });
 
-        if (messages.isEmpty) {
-          setState(() {
-            _failedCount++;
-            _failedSessions.add(
-              '${session.displayName ?? session.username} (无消息)',
-            );
-          });
+        // 1. 扫描阶段
+        List<Message> allMessages = [];
+        int offset = 0;
+        const int batchSize = 5000;
+        bool hasMore = true;
+        int batchCount = 0;
+
+        while (hasMore) {
+          final batch = await dbService.getMessages(
+            username,
+            limit: batchSize,
+            offset: offset,
+          );
+
+          if (batch.isEmpty) {
+            hasMore = false;
+          } else {
+            final latestInBatch = batch.first.createTime;
+            final earliestInBatch = batch.last.createTime;
+
+            // 智能早停
+            if (startTime != null && latestInBatch < startTime) {
+              hasMore = false;
+              break;
+            }
+
+            final filteredBatch = batch.where((m) {
+              if (startTime != null && m.createTime < startTime) return false;
+              if (endTime != null && m.createTime > endTime) return false;
+              return true;
+            }).toList();
+
+            allMessages.addAll(filteredBatch);
+
+            if (startTime != null && earliestInBatch < startTime) {
+              hasMore = false;
+            }
+
+            if (batch.length < batchSize) {
+              hasMore = false;
+            }
+            offset += batch.length;
+
+            if (!mounted) return;
+
+            // 每处理 2 个大批次刷新一次 UI
+            batchCount++;
+            if (batchCount % 2 == 0 || !hasMore) {
+              setState(() {
+                _currentExportedCount = allMessages.length;
+              });
+              // 出让主线程控制权，防止 UI 卡死
+              await Future.delayed(Duration.zero);
+            }
+          }
+        }
+
+        // 构建或获取会话实体对象，用于导出服务
+        ChatSession? targetSession = sessions
+            .where((s) => s.username == username)
+            .firstOrNull;
+        targetSession ??= widget.allSessions
+            .where((s) => s.username == username)
+            .firstOrNull;
+
+        if (targetSession == null) {
+          // 如果实在找不到，记录失败并跳过
+          _failedCount++;
           continue;
         }
 
-        // 构建文件路径
-        final displayName = session.displayName ?? session.username;
-        final sanitizedName = displayName.replaceAll(
-          RegExp(r'[<>:"/\\|?*]'),
-          '_',
-        );
-        final timestamp = DateTime.now().millisecondsSinceEpoch;
-        final extension = widget.format;
-        final filePath =
-            '${widget.exportFolder}${Platform.pathSeparator}${sanitizedName}_$timestamp.$extension';
+        // 2. 写入阶段
+        if (!mounted) return;
+        setState(() {
+          _progress = (i + 0.1) / _totalSessions;
+          _currentSessionName =
+              "正在写入 $displayName (${allMessages.length} 条消息)...";
+        });
 
-        // 导出
-        bool success = false;
-        final exportService = ChatExportService(databaseService);
+        // 排序
+        allMessages.sort((a, b) => a.createTime.compareTo(b.createTime));
+        await Future.delayed(Duration.zero);
+
+        bool result = false;
+        final safeName = displayName.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+        final timestamp = DateTime.now().millisecondsSinceEpoch;
+        final savePath =
+            '${widget.exportFolder}/${safeName}_$timestamp.${widget.format}';
+
+        // 设置较接近完成的进度
+        setState(() {
+          _progress = (i + 0.9) / _totalSessions;
+        });
 
         switch (widget.format) {
           case 'json':
-            success = await exportService.exportToJson(
-              session,
-              messages.reversed.toList(),
-              filePath: filePath,
+            result = await exportService.exportToJson(
+              targetSession,
+              allMessages,
+              filePath: savePath,
             );
             break;
           case 'html':
-            success = await exportService.exportToHtml(
-              session,
-              messages.reversed.toList(),
-              filePath: filePath,
+            result = await exportService.exportToHtml(
+              targetSession,
+              allMessages,
+              filePath: savePath,
             );
             break;
           case 'xlsx':
-            success = await exportService.exportToExcel(
-              session,
-              messages.reversed.toList(),
-              filePath: filePath,
+            result = await exportService.exportToExcel(
+              targetSession,
+              allMessages,
+              filePath: savePath,
             );
             break;
           case 'sql':
-            success = await exportService.exportToPostgreSQL(
-              session,
-              messages.reversed.toList(),
-              filePath: filePath,
+            result = await exportService.exportToPostgreSQL(
+              targetSession,
+              allMessages,
+              filePath: savePath,
             );
             break;
         }
 
-        if (success) {
-          setState(() {
-            _successCount++;
-            _totalMessagesProcessed += messages.length;
-          });
-        } else {
-          setState(() {
-            _failedCount++;
-            _failedSessions.add(
-              '${session.displayName ?? session.username} (导出失败)',
-            );
-          });
-        }
-      } catch (e) {
+        if (!mounted) return;
         setState(() {
-          _failedCount++;
-          _failedSessions.add(
-            '${session.displayName ?? session.username} ($e)',
-          );
+          if (result) {
+            _successCount++;
+            _totalMessagesProcessed += allMessages.length;
+          } else {
+            _failedCount++;
+          }
+          _progress = (i + 1.0) / _totalSessions;
         });
       }
 
-      // 让UI有机会更新
-      await Future.delayed(const Duration(milliseconds: 50));
+      if (!mounted) return;
+      setState(() {
+        _status = _ExportStatus.completed;
+        _progress = 1.0;
+      });
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _status = _ExportStatus.error;
+          _errorMessage = e.toString();
+        });
+      }
     }
+  }
 
-    setState(() => _isCompleted = true);
+  // 辅助方法：打开文件夹
+  Future<void> _openFolder() async {
+    final path = widget.exportFolder;
+    final uri = Uri.directory(path);
+    try {
+      if (!await launchUrl(uri)) {
+        throw '无法打开文件夹';
+      }
+    } catch (e) {
+      // 平台特定的回退处理
+      try {
+        if (Platform.isWindows) {
+          await Process.run('explorer', [path]);
+        } else if (Platform.isMacOS) {
+          await Process.run('open', [path]);
+        } else if (Platform.isLinux) {
+          await Process.run('xdg-open', [path]);
+        }
+      } catch (_) {}
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    final progress = widget.sessions.isEmpty
-        ? 0.0
-        : (_currentIndex + 1) / widget.sessions.length;
-    final remaining = widget.sessions.length - (_currentIndex + 1);
+    final isCompleted = _status == _ExportStatus.completed;
+    final isError = _status == _ExportStatus.error;
 
-    return AlertDialog(
-      title: Text(_isCompleted ? '导出完成' : '正在导出'),
-      content: SizedBox(
-        width: 450,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
+    // 对话框尺寸及形状
+    return Dialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      backgroundColor: Colors.white,
+      elevation: 8,
+      child: Container(
+        width: 500, // 为桌面端设计的固定宽度
+        padding: const EdgeInsets.all(32),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(16),
+          color: Colors.white,
+        ),
+        child: isCompleted
+            ? _buildCompletedUI()
+            : (isError ? _buildErrorUI() : _buildProgressUI()),
+      ),
+    );
+  }
+
+  Widget _buildProgressUI() {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        // Title
+        Text(
+          '正在导出',
+          style: Theme.of(
+            context,
+          ).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 24),
+
+        // 当前会话名称
+        Text(
+          _currentSessionName.isEmpty ? '准备中...' : _currentSessionName,
+          style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w500),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
+        const SizedBox(height: 16),
+
+        // 状态文字：扫描中/写入中
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            if (!_isCompleted) ...[
-              LinearProgressIndicator(
-                value: progress,
-                minHeight: 8,
-                borderRadius: BorderRadius.circular(4),
-              ),
-              const SizedBox(height: 16),
+            Text(
+              _currentSessionName.contains('正在写入') ? '正在导出资源...' : '正在扫描会话...',
+              style: TextStyle(color: Colors.grey.shade600, fontSize: 13),
+            ),
+            if (_progress > 0 && _progress <= 1.0)
               Text(
-                '当前会话: $_currentSessionName',
-                style: const TextStyle(fontWeight: FontWeight.w600),
-              ),
-              const SizedBox(height: 8),
-              Text('当前消息数: $_currentMessageCount 条'),
-              const SizedBox(height: 8),
-              Text('会话进度: ${_currentIndex + 1} / ${widget.sessions.length}'),
-              const SizedBox(height: 4),
-              Text('剩余会话: $remaining 个'),
-              const SizedBox(height: 8),
-              Text(
-                '已导出消息: $_totalMessagesProcessed 条',
-                style: TextStyle(color: Colors.grey.shade600),
-              ),
-            ] else ...[
-              Row(
-                children: [
-                  const Icon(Icons.check_circle, color: Colors.green, size: 48),
-                  const SizedBox(width: 16),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          '成功: $_successCount',
-                          style: const TextStyle(
-                            color: Colors.green,
-                            fontWeight: FontWeight.bold,
-                            fontSize: 16,
-                          ),
-                        ),
-                        Text(
-                          '总计导出: $_totalMessagesProcessed 条消息',
-                          style: TextStyle(color: Colors.grey.shade700),
-                        ),
-                        if (_failedCount > 0) ...[
-                          const SizedBox(height: 4),
-                          Text(
-                            '失败: $_failedCount',
-                            style: const TextStyle(
-                              color: Colors.red,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                        ],
-                      ],
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 12),
-              Text(
-                '文件位置: ${widget.exportFolder}',
-                style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
-              ),
-              if (_failedSessions.isNotEmpty) ...[
-                const SizedBox(height: 16),
-                const Text(
-                  '失败列表:',
-                  style: TextStyle(fontWeight: FontWeight.bold),
+                '${(_progress * 100).toStringAsFixed(1)}%',
+                style: const TextStyle(
+                  color: Color(0xFF07C160),
+                  fontSize: 13,
+                  fontWeight: FontWeight.bold,
                 ),
-                const SizedBox(height: 8),
-                Container(
-                  constraints: const BoxConstraints(maxHeight: 200),
-                  child: SingleChildScrollView(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: _failedSessions
-                          .map(
-                            (name) => Padding(
-                              padding: const EdgeInsets.only(bottom: 4),
-                              child: Text(
-                                '• $name',
-                                style: const TextStyle(fontSize: 12),
-                              ),
-                            ),
-                          )
-                          .toList(),
-                    ),
-                  ),
-                ),
-              ],
-            ],
+              ),
           ],
         ),
-      ),
-      actions: [
-        if (_isCompleted) ...[
-          TextButton(
-            onPressed: () async {
-              final path = widget.exportFolder;
-              final uri = Uri.directory(path);
-              try {
-                if (!await launchUrl(uri)) {
-                  throw 'Could not launch $uri';
-                }
-              } catch (e) {
-                // 如果 url_launcher 失败，尝试使用系统命令
-                if (Platform.isWindows) {
-                  await Process.run('explorer', [path]);
-                } else if (Platform.isMacOS) {
-                  await Process.run('open', [path]);
-                } else if (Platform.isLinux) {
-                  await Process.run('xdg-open', [path]);
-                }
-              }
-            },
-            child: const Text('打开所在文件夹'),
+        const SizedBox(height: 8),
+
+        // 进度条
+        ClipRRect(
+          borderRadius: BorderRadius.circular(4),
+          child: LinearProgressIndicator(
+            value: _progress <= 0 ? null : _progress,
+            minHeight: 8,
+            backgroundColor: Colors.grey.shade100,
+            valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF07C160)),
           ),
-          TextButton(
+        ),
+        const SizedBox(height: 12),
+
+        // 详情统计
+        Align(
+          alignment: Alignment.centerRight,
+          child: Text(
+            _currentSessionName.contains('正在写入')
+                ? '正在写入数据: $_currentExportedCount 条'
+                : '已扫描消息: $_currentExportedCount 条',
+            style: TextStyle(color: Colors.grey.shade500, fontSize: 12),
+          ),
+        ),
+        const SizedBox(height: 24),
+
+        // 统计行：已导出消息 | 剩余会话
+        Row(
+          children: [
+            _buildStatItem('已导出消息', '$_totalMessagesProcessed'),
+            Container(
+              height: 30,
+              width: 1,
+              color: Colors.grey.shade300,
+              margin: const EdgeInsets.symmetric(horizontal: 24),
+            ),
+            _buildStatItem(
+              '剩余会话',
+              '${_totalSessions - (_successCount + _failedCount)}',
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildCompletedUI() {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          '导出完成',
+          style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 32),
+
+        Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                border: Border.all(color: const Color(0xFF07C160), width: 2),
+              ),
+              child: const Icon(
+                Icons.check,
+                color: Color(0xFF07C160),
+                size: 32,
+              ),
+            ),
+            const SizedBox(width: 16),
+            const Text(
+              '导出已完成',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.w500),
+            ),
+          ],
+        ),
+        const SizedBox(height: 32),
+
+        // 统计行
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            _buildStatItem(
+              '成功',
+              '$_successCount',
+              valueColor: const Color(0xFF07C160),
+            ),
+            Container(height: 30, width: 1, color: Colors.grey.shade300),
+            _buildStatItem(
+              '失败',
+              '$_failedCount',
+              valueColor: _failedCount > 0 ? Colors.red : null,
+            ),
+            Container(height: 30, width: 1, color: Colors.grey.shade300),
+            _buildStatItem('总消息', '$_totalMessagesProcessed'),
+          ],
+        ),
+        const SizedBox(height: 24),
+
+        // 文件路径
+        Text(
+          '文件位置',
+          style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          widget.exportFolder,
+          style: TextStyle(fontSize: 13, color: Colors.grey.shade800),
+        ),
+
+        const SizedBox(height: 32),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.end,
+          children: [
+            TextButton(
+              onPressed: _openFolder,
+              style: TextButton.styleFrom(
+                foregroundColor: const Color(0xFF07C160),
+              ),
+              child: const Text(
+                '打开所在文件夹',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+            ),
+            const SizedBox(width: 16),
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              style: TextButton.styleFrom(
+                foregroundColor: const Color(0xFF07C160),
+              ),
+              child: const Text(
+                '关闭',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildErrorUI() {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          '导出失败',
+          style: TextStyle(
+            fontSize: 20,
+            fontWeight: FontWeight.bold,
+            color: Colors.red,
+          ),
+        ),
+        const SizedBox(height: 24),
+        Text(_errorMessage ?? '未知错误'),
+        const SizedBox(height: 32),
+        Align(
+          alignment: Alignment.centerRight,
+          child: TextButton(
             onPressed: () => Navigator.pop(context),
             child: const Text('关闭'),
           ),
-        ],
+        ),
       ],
+    );
+  }
+
+  Widget _buildStatItem(String label, String value, {Color? valueColor}) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          label,
+          style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          value,
+          style: TextStyle(
+            fontSize: 20,
+            fontWeight: FontWeight.w500,
+            color: valueColor ?? Colors.black87,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// 内部辅助组件：带动画的条形图
+class _AnimatedBar extends StatefulWidget {
+  final int index;
+  final Color color;
+  final double baseHeight;
+  final double maxExtraHeight;
+
+  const _AnimatedBar({
+    required this.index,
+    required this.color,
+    required this.baseHeight,
+    required this.maxExtraHeight,
+  });
+
+  @override
+  State<_AnimatedBar> createState() => _AnimatedBarState();
+}
+
+class _AnimatedBarState extends State<_AnimatedBar>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _controller;
+  late Animation<double> _animation;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 600),
+    );
+
+    _animation = CurvedAnimation(parent: _controller, curve: Curves.easeInOut);
+
+    Future.delayed(Duration(milliseconds: widget.index * 150), () {
+      if (mounted) _controller.repeat(reverse: true);
+    });
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _animation,
+      builder: (context, child) {
+        return Container(
+          width: 8,
+          height:
+              widget.baseHeight + (widget.maxExtraHeight * _animation.value),
+          decoration: BoxDecoration(
+            color: widget.color.withValues(
+              alpha: 0.3 + (0.7 * _animation.value),
+            ),
+            borderRadius: BorderRadius.circular(4),
+          ),
+        );
+      },
     );
   }
 }

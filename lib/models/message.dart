@@ -215,9 +215,9 @@ class Message {
       logger.debug(
         'Message',
         'voice msg parsed: localId=${intValue(['local_id'])} '
-        'create=${intValue(['create_time'])} '
-        'sender=$senderUsername '
-        'durationStr="$durationStr" -> $voiceDurationSeconds',
+            'create=${intValue(['create_time'])} '
+            'sender=$senderUsername '
+            'durationStr="$durationStr" -> $voiceDurationSeconds',
       );
     }
 
@@ -351,7 +351,11 @@ class Message {
 
     final localType = intValue(['local_type', 'type', 'localType']);
     final senderUsername = stringValue(['sender_username']);
-    final isSendVal = nullableIntValue(['computed_is_send', 'is_send', 'isSend']);
+    final isSendVal = nullableIntValue([
+      'computed_is_send',
+      'is_send',
+      'isSend',
+    ]);
 
     final packed = () {
       final raw = map['packed_info_data'];
@@ -490,6 +494,9 @@ class Message {
 
       case 47: // 动画表情
         return '[动画表情]';
+
+      case 50: // VOIP通话
+        return '[通话消息]';
 
       case 48: // 位置消息
         final location = _extractValueFromXml(decodedContent, 'label');
@@ -683,8 +690,10 @@ class Message {
     // 去掉图片标签
     text = text.replaceAll(RegExp(r'<img[^>]*>', caseSensitive: false), '');
     // 去掉自定义链接/标签，但保留中间文字
-    text =
-        text.replaceAll(RegExp(r'</?[_a-zA-Z0-9]+[^>]*>', caseSensitive: false), '');
+    text = text.replaceAll(
+      RegExp(r'</?[_a-zA-Z0-9]+[^>]*>', caseSensitive: false),
+      '',
+    );
     // 去掉多余空白
     text = text.replaceAll(RegExp(r'\s+'), ' ').trim();
     return text;
@@ -993,6 +1002,8 @@ class Message {
         return '动画表情';
       case 48:
         return '位置消息';
+      case 50:
+        return '通话消息';
       case 10000:
         return '系统消息';
       case 244813135921:
@@ -1026,7 +1037,7 @@ class Message {
     }
   }
 
-  /// 获取消息类型描述 
+  /// 获取消息类型描述
   String get typeDescription {
     // 内部直接调用我们新的静态方法，避免代码重复
     return Message.getTypeDescriptionFromInt(localType);
@@ -1080,8 +1091,9 @@ class Message {
     final text = printable.toString();
 
     // 优先匹配形如 abc.t.dat / abc.dat
-    final datMatch =
-        RegExp(r'([0-9a-fA-F]{8,})(?:\\.t)?\\.dat').firstMatch(text);
+    final datMatch = RegExp(
+      r'([0-9a-fA-F]{8,})(?:\\.t)?\\.dat',
+    ).firstMatch(text);
     if (datMatch != null) {
       return datMatch.group(1)!.toLowerCase();
     }
@@ -1160,16 +1172,13 @@ class Message {
         final type = _extractValueFromXml(referMsgXml, 'type');
 
         // 按类型渲染引用消息，避免显示wxid/文件名等原始信息
-        final rendered = _renderQuotedContentByType(
-          referredContent,
-          type,
-        );
+        final rendered = _renderQuotedContentByType(referredContent, type);
         if (rendered.isEmpty) return '';
 
         final cleanDisplayName =
             displayName.isNotEmpty && !_looksLikeWxid(displayName)
-                ? displayName
-                : '';
+            ? displayName
+            : '';
 
         return cleanDisplayName.isNotEmpty
             ? '$cleanDisplayName: $rendered'
@@ -1211,10 +1220,7 @@ class Message {
   }
 
   /// 根据引用消息类型渲染文本，防止暴露wxid/文件名
-  static String _renderQuotedContentByType(
-    String rawContent,
-    String type,
-  ) {
+  static String _renderQuotedContentByType(String rawContent, String type) {
     switch (type) {
       case '1': // 文本
       case '':
