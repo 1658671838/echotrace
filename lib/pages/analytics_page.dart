@@ -2,15 +2,18 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../providers/app_state.dart';
 import '../services/analytics_service.dart';
 import '../services/database_service.dart';
 import '../services/analytics_cache_service.dart';
+import '../services/dual_report_cache_service.dart';
+import '../services/dual_report_service.dart';
 import '../services/logger_service.dart';
 import '../models/analytics_data.dart';
 import '../utils/string_utils.dart';
+import '../widgets/annual_report/dual_report_html_renderer.dart';
 import 'annual_report_display_page.dart';
-import 'friend_selection_page.dart';
 
 /// 数据分析页面
 class AnalyticsPage extends StatefulWidget {
@@ -36,6 +39,7 @@ class _AnalyticsPageState extends State<AnalyticsPage> {
 
   // Top N 选择
   int _topN = 10;
+  bool _showDualReportSubPage = false;
 
   @override
   void initState() {
@@ -402,9 +406,17 @@ class _AnalyticsPageState extends State<AnalyticsPage> {
               switchOutCurve: Curves.easeIn,
               child: _isLoading
                   ? _buildLoadingView()
-                  : _overallStats == null
-                      ? _buildEmptyView()
-                      : _buildContent(),
+                  : _showDualReportSubPage
+                      ? _DualReportSubPage(
+                          databaseService: widget.databaseService,
+                          rankings: _allContactRankings ?? const <ContactRanking>[],
+                          onClose: () {
+                            setState(() => _showDualReportSubPage = false);
+                          },
+                        )
+                      : _overallStats == null
+                          ? _buildEmptyView()
+                          : _buildContent(),
             ),
           ),
         ],
@@ -688,30 +700,7 @@ class _AnalyticsPageState extends State<AnalyticsPage> {
         onTap: _isLoading
             ? null
             : () async {
-                // 显示加载状态
-                setState(() {
-                  _isLoading = true;
-                  _loadingStatus = '正在准备双人报告...';
-                });
-
-                try {
-                  await Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (context) => FriendSelectionPage(
-                        databaseService: widget.databaseService,
-                      ),
-                    ),
-                  );
-                } finally {
-                  // 隐藏加载状态
-                  if (mounted) {
-                    setState(() {
-                      _isLoading = false;
-                      _loadingStatus = '';
-                    });
-                  }
-                }
+                setState(() => _showDualReportSubPage = true);
               },
         borderRadius: BorderRadius.circular(12),
         child: Container(
@@ -1102,6 +1091,593 @@ class _AvatarWithRank extends StatelessWidget {
           ),
         ),
       ],
+    );
+  }
+}
+
+class _DualReportSubPage extends StatefulWidget {
+  final DatabaseService databaseService;
+  final List<ContactRanking> rankings;
+  final VoidCallback onClose;
+
+  const _DualReportSubPage({
+    required this.databaseService,
+    required this.rankings,
+    required this.onClose,
+  });
+
+  @override
+  State<_DualReportSubPage> createState() => _DualReportSubPageState();
+}
+
+class _DualReportSubPageState extends State<_DualReportSubPage> {
+  static const _wechatGreen = Color(0xFF07C160);
+
+  int _topN = 10;
+  ContactRanking? _selectedFriend;
+  Map<String, dynamic>? _reportData;
+  String? _reportHtml;
+  String? _reportUrl;
+  HttpServer? _reportServer;
+
+  bool _isGenerating = false;
+  bool _isHtmlLoading = false;
+  bool _isOpeningBrowser = false;
+  bool _didAutoOpen = false;
+  String? _errorMessage;
+
+  @override
+  void dispose() {
+    _stopReportServer();
+    super.dispose();
+  }
+
+  Future<void> _generateReportFor(ContactRanking ranking) async {
+    if (_isGenerating) return;
+    setState(() {
+      _isGenerating = true;
+      _isHtmlLoading = false;
+      _errorMessage = null;
+      _selectedFriend = ranking;
+    });
+
+    try {
+      final cached = await DualReportCacheService.loadReport(
+        ranking.username,
+        null,
+      );
+      Map<String, dynamic> reportData;
+      if (cached != null) {
+        reportData = cached;
+      } else {
+        final service = DualReportService(widget.databaseService);
+        reportData = await service.generateDualReport(
+          friendUsername: ranking.username,
+          filterYear: null,
+        );
+        await DualReportCacheService.saveReport(
+          ranking.username,
+          null,
+          reportData,
+        );
+      }
+
+      await _buildReportHtml(reportData);
+      await _startReportServer();
+      if (!_didAutoOpen) {
+        _didAutoOpen = true;
+        await _openReportInBrowser();
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _errorMessage = '生成双人报告失败: $e');
+    } finally {
+      if (mounted) {
+        setState(() => _isGenerating = false);
+      }
+    }
+  }
+
+  Future<void> _buildReportHtml(Map<String, dynamic> reportData) async {
+    if (!mounted) return;
+    setState(() => _isHtmlLoading = true);
+    try {
+      final myName = reportData['myName']?.toString() ?? '';
+      final friendName =
+          reportData['friendName']?.toString() ??
+          _selectedFriend?.displayName ??
+          '';
+      final html = await DualReportHtmlRenderer.build(
+        reportData: reportData,
+        myName: myName,
+        friendName: friendName,
+      );
+      if (!mounted) return;
+      setState(() {
+        _reportData = reportData;
+        _reportHtml = html;
+      });
+    } finally {
+      if (mounted) {
+        setState(() => _isHtmlLoading = false);
+      }
+    }
+  }
+
+  Future<void> _openReportInBrowser() async {
+    if (_reportHtml == null || _isOpeningBrowser) return;
+    setState(() => _isOpeningBrowser = true);
+    try {
+      await _startReportServer();
+      if (_reportUrl == null) {
+        throw StateError('报告服务未启动');
+      }
+      final uri = Uri.parse(_reportUrl!);
+      final launched = await launchUrl(
+        uri,
+        mode: LaunchMode.externalApplication,
+      );
+      if (!launched && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('无法打开浏览器，请检查默认浏览器设置')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('打开浏览器失败: $e')),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isOpeningBrowser = false);
+      }
+    }
+  }
+
+  Future<void> _refreshPreview() async {
+    if (_reportData == null) return;
+    await _buildReportHtml(_reportData!);
+    await _startReportServer();
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('预览已刷新，请在浏览器中刷新页面')),
+      );
+    }
+  }
+
+  Future<void> _startReportServer() async {
+    if (_reportHtml == null) return;
+    if (_reportServer != null) return;
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    _reportServer = server;
+    _reportUrl = 'http://127.0.0.1:${server.port}/';
+    server.listen((request) async {
+      if (request.uri.path == '/favicon.ico') {
+        request.response.statusCode = HttpStatus.noContent;
+        await request.response.close();
+        return;
+      }
+      if (request.uri.path != '/' && request.uri.path != '/index.html') {
+        request.response
+          ..statusCode = HttpStatus.notFound
+          ..headers.contentType = ContentType.text
+          ..write('Not Found');
+        await request.response.close();
+        return;
+      }
+      request.response.headers.contentType = ContentType.html;
+      request.response.write(_reportHtml);
+      await request.response.close();
+    });
+  }
+
+  void _stopReportServer() {
+    _reportServer?.close(force: true);
+    _reportServer = null;
+    _reportUrl = null;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        _buildHeader(),
+        Expanded(
+          child: AnimatedSwitcher(
+            duration: const Duration(milliseconds: 200),
+            child: _isGenerating || _isHtmlLoading
+                ? _buildGeneratingView()
+                : _errorMessage != null
+                ? _buildErrorView()
+                : _reportHtml != null
+                ? _buildReportReadyView()
+                : _buildSelectionView(),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildHeader() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: Border(
+          bottom: BorderSide(color: Colors.grey.withValues(alpha: 0.1)),
+        ),
+      ),
+      child: Row(
+        children: [
+          IconButton(
+            onPressed: widget.onClose,
+            icon: const Icon(Icons.arrow_back),
+            tooltip: '返回数据分析',
+          ),
+          const SizedBox(width: 4),
+          Text(
+            '双人报告',
+            style: Theme.of(context).textTheme.titleLarge?.copyWith(
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          const Spacer(),
+          if (_selectedFriend != null)
+            Text(
+              _selectedFriend!.displayName,
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                color: Colors.grey[600],
+              ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSelectionView() {
+    return ListView(
+      key: const ValueKey('dual_report_selection'),
+      padding: const EdgeInsets.all(16),
+      children: [
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Row(
+              children: [
+                Icon(Icons.info_outline, color: Theme.of(context).primaryColor),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    '从聊天排行中选择一位好友生成双人报告',
+                    style: Theme.of(context).textTheme.bodyMedium,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 16),
+        _buildRankingCard(),
+      ],
+    );
+  }
+
+  Widget _buildRankingCard() {
+    if (widget.rankings.isEmpty) {
+      return const Card(
+        child: Padding(
+          padding: EdgeInsets.all(24),
+          child: Center(child: Text('暂无聊天排行数据')),
+        ),
+      );
+    }
+
+    final visibleRankings = widget.rankings.take(_topN).toList();
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(
+                  '聊天排行 Top $_topN',
+                  style: const TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                SegmentedButton<int>(
+                  segments: const [
+                    ButtonSegment<int>(value: 10, label: Text('Top 10')),
+                    ButtonSegment<int>(value: 20, label: Text('Top 20')),
+                    ButtonSegment<int>(value: 50, label: Text('Top 50')),
+                  ],
+                  selected: {_topN},
+                  onSelectionChanged: (Set<int> newSelection) {
+                    setState(() {
+                      _topN = newSelection.first;
+                    });
+                  },
+                  style: ButtonStyle(
+                    visualDensity: VisualDensity.compact,
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Column(
+              children: visibleRankings.asMap().entries.map((entry) {
+                final index = entry.key;
+                final ranking = entry.value;
+                final appState = Provider.of<AppState>(context);
+                final avatarUrl = appState.getAvatarUrl(ranking.username);
+                return ListTile(
+                  key: ValueKey('${ranking.username}_dual_$index'),
+                  leading: _AvatarWithRank(
+                    avatarUrl: avatarUrl,
+                    rank: index + 1,
+                    displayName: ranking.displayName,
+                  ),
+                  title: Text(
+                    StringUtils.cleanOrDefault(
+                      ranking.displayName,
+                      ranking.username,
+                    ),
+                    style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  subtitle: Text(
+                    '发送 ${ranking.sentCount} | 接收 ${ranking.receivedCount}',
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: Theme.of(
+                        context,
+                      ).colorScheme.onSurface.withValues(alpha: 0.6),
+                    ),
+                  ),
+                  trailing: Text(
+                    '${ranking.messageCount}',
+                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  onTap: () => _generateReportFor(ranking),
+                );
+              }).toList(),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildGeneratingView() {
+    final friendName = _selectedFriend?.displayName ?? '好友';
+    return Center(
+      key: const ValueKey('dual_report_generating'),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const CircularProgressIndicator(
+            valueColor: AlwaysStoppedAnimation<Color>(_wechatGreen),
+          ),
+          const SizedBox(height: 16),
+          Text(
+            '正在生成 $friendName 的双人报告...',
+            style: Theme.of(context).textTheme.titleMedium,
+          ),
+          const SizedBox(height: 8),
+          Text(
+            '请稍候',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              color: Colors.grey[600],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildErrorView() {
+    return Center(
+      key: const ValueKey('dual_report_error'),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const Icon(Icons.error_outline, size: 64, color: Colors.red),
+          const SizedBox(height: 16),
+          Text(
+            _errorMessage ?? '生成失败',
+            style: const TextStyle(color: Colors.red),
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 16),
+          ElevatedButton(
+            onPressed: () {
+              setState(() {
+                _errorMessage = null;
+                _reportHtml = null;
+                _reportData = null;
+                _selectedFriend = null;
+              });
+            },
+            child: const Text('返回选择'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildReportReadyView() {
+    if (!Platform.isWindows) {
+      return Center(
+        key: const ValueKey('dual_report_platform'),
+        child: Text(
+          '双人报告 HTML 仅支持 Windows 平台',
+          style: TextStyle(color: Colors.grey[700]),
+        ),
+      );
+    }
+
+    return Container(
+      key: const ValueKey('dual_report_ready'),
+      color: const Color(0xFFF7F7F5),
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Container(
+                constraints: const BoxConstraints(maxWidth: 560),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 36,
+                  vertical: 32,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(28),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.08),
+                      blurRadius: 30,
+                      offset: const Offset(0, 12),
+                    ),
+                  ],
+                ),
+                child: Column(
+                  children: [
+                    Container(
+                      width: 64,
+                      height: 64,
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFE6F6EE),
+                        borderRadius: BorderRadius.circular(18),
+                      ),
+                      child: const Icon(
+                        Icons.public,
+                        size: 32,
+                        color: _wechatGreen,
+                      ),
+                    ),
+                    const SizedBox(height: 20),
+                    Text(
+                      '双人报告已生成',
+                      style: TextStyle(
+                        fontSize: 22,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.grey[900],
+                        letterSpacing: 0.5,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      '前往浏览器预览',
+                      style: TextStyle(
+                        fontSize: 14,
+                        color: Colors.grey[600],
+                      ),
+                      textAlign: TextAlign.center,
+                    ),
+                    const SizedBox(height: 20),
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFF6F6F4),
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            '本地预览地址',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.grey[600],
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                          SelectableText(
+                            _reportUrl ?? '尚未启动（点击打开或刷新预览）',
+                            style: TextStyle(
+                              fontSize: 13,
+                              color: Colors.grey[800],
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            '提示：建议使用 Chrome 或 Edge 浏览器以获得最佳预览效果',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.grey[500],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 22),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        ElevatedButton.icon(
+                          onPressed:
+                              _isOpeningBrowser ? null : _openReportInBrowser,
+                          icon: _isOpeningBrowser
+                              ? const SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              : const Icon(Icons.open_in_new),
+                          label: const Text('打开浏览器'),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: _wechatGreen,
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 24,
+                              vertical: 12,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        OutlinedButton.icon(
+                          onPressed: _isHtmlLoading ? null : _refreshPreview,
+                          icon: const Icon(Icons.refresh),
+                          label: const Text('刷新预览'),
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: _wechatGreen,
+                            side: const BorderSide(color: _wechatGreen),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 20,
+                              vertical: 12,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    TextButton(
+                      onPressed: widget.onClose,
+                      style: TextButton.styleFrom(foregroundColor: Colors.grey),
+                      child: const Text('关闭'),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }
