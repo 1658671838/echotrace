@@ -327,4 +327,81 @@ class DualReportService {
       rethrow;
     }
   }
+
+  /// 获取推荐好友列表（按消息数量排序）
+  Future<List<Map<String, dynamic>>> getRecommendedFriends({
+    required int limit,
+    int? filterYear,
+  }) async {
+    try {
+      // 获取按消息数量排序的联系人数据
+      final topContacts = await _databaseService.getTopContactsData(
+        limit: limit,
+        year: filterYear,
+      );
+
+      // 获取所有联系人信息以获取显示名称
+      final allContacts = await _databaseService.getAllContacts();
+
+      // 映射结果，添加显示名称
+      final result = <Map<String, dynamic>>[];
+      for (final contactData in topContacts) {
+        final username = contactData['username'] as String? ?? '';
+
+        // 查找联系人的显示名称
+        String displayName = username;
+        try {
+          final contactRecord = allContacts.firstWhere(
+            (c) => c.contact.username == username,
+            orElse: () => allContacts.firstWhere(
+              (c) => c.contact.username.contains(username) || username.contains(c.contact.username),
+              orElse: () => ContactRecord(
+                contact: Contact(
+                  id: 0,
+                  username: username,
+                  localType: 0,
+                  alias: '',
+                  encryptUsername: '',
+                  flag: 0,
+                  deleteFlag: 0,
+                  verifyFlag: 0,
+                  remark: '',
+                  remarkQuanPin: '',
+                  remarkPinYinInitial: '',
+                  nickName: '',
+                  pinYinInitial: '',
+                  quanPin: '',
+                  bigHeadUrl: '',
+                  smallHeadUrl: '',
+                  headImgMd5: '',
+                  chatRoomNotify: 0,
+                  isInChatRoom: 0,
+                  description: '',
+                  extraBuffer: [],
+                  chatRoomType: 0,
+                ),
+                source: ContactRecognitionSource.friend,
+                origin: ContactDataOrigin.unknown,
+              ),
+            ),
+          );
+          displayName = contactRecord.contact.displayName;
+        } catch (e) {
+          // 如果找不到联系人，使用username作为显示名称
+          displayName = username;
+        }
+
+        result.add({
+          'username': username,
+          'displayName': displayName,
+          'messageCount': contactData['total'] as int? ?? 0,
+        });
+      }
+
+      return result;
+    } catch (e) {
+      print('获取推荐好友列表失败: $e');
+      rethrow;
+    }
+  }
 }

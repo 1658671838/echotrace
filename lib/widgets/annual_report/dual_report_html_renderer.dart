@@ -277,12 +277,14 @@ body {
 
   /// 构建封面
   static String _buildCoverBody(String myName, String friendName) {
+    final escapedMyName = _escapeHtml(myName);
+    final escapedFriendName = _escapeHtml(friendName);
     return '''
 <div class="label-text">ECHO TRACE · DUAL REPORT</div>
 <div class="hero-names">
-  <span class="name">$myName</span>
+  <span class="name">$escapedMyName</span>
   <span class="ampersand">&</span>
-  <span class="name">$friendName</span>
+  <span class="name">$escapedFriendName</span>
 </div>
 <hr class="divider">
 <div class="hero-desc">每一段对话<br>都是独一无二的相遇<br><br>让我们一起回顾<br>那些珍贵的聊天时光</div>

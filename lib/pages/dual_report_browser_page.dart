@@ -62,11 +62,13 @@ class _DualReportBrowserPageState extends State<DualReportBrowserPage> {
           friendName: widget.friendName,
         );
 
+        if (!mounted) return;
         setState(() {
           _reportHtml = html;
         });
 
         // 启动服务器并打开浏览器
+        if (!mounted) return;
         await _startReportServer();
         return;
       }
@@ -93,13 +95,16 @@ class _DualReportBrowserPageState extends State<DualReportBrowserPage> {
         friendName: widget.friendName,
       );
 
+      if (!mounted) return;
       setState(() {
         _reportHtml = html;
       });
 
       // 启动服务器并打开浏览器
+      if (!mounted) return;
       await _startReportServer();
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _errorMessage = '生成报告失败: $e';
         _isGenerating = false;
