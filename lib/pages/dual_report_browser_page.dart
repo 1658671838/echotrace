@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../services/database_service.dart';
 import '../services/dual_report_service.dart';
+import '../services/dual_report_cache_service.dart';
 import '../widgets/annual_report/dual_report_html_renderer.dart';
 
 /// 双人报告浏览器展示页面（类似年度报告）
@@ -51,6 +52,25 @@ class _DualReportBrowserPageState extends State<DualReportBrowserPage> {
     });
 
     try {
+      // 首先检查缓存
+      final cachedData = await DualReportCacheService.loadReport(widget.friendUsername, widget.year);
+      if (cachedData != null) {
+        // 使用缓存数据生成HTML
+        final html = await DualReportHtmlRenderer.build(
+          reportData: cachedData,
+          myName: cachedData['myName'].toString(),
+          friendName: widget.friendName,
+        );
+
+        setState(() {
+          _reportHtml = html;
+        });
+
+        // 启动服务器并打开浏览器
+        await _startReportServer();
+        return;
+      }
+
       // 获取当前用户wxid
       final myWxid = widget.databaseService.currentAccountWxid ?? '我';
 
@@ -62,6 +82,9 @@ class _DualReportBrowserPageState extends State<DualReportBrowserPage> {
         myName: myWxid,
         year: widget.year,
       );
+
+      // 保存到缓存
+      await DualReportCacheService.saveReport(widget.friendUsername, widget.year, reportData);
 
       // 生成HTML
       final html = await DualReportHtmlRenderer.build(

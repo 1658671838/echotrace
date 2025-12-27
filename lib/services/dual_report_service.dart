@@ -29,6 +29,10 @@ class DualReportService {
     // 获取我的微信显示名称
     final myDisplayName = await _getMyDisplayName(myName);
 
+    // 获取年度统计数据
+    final actualYear = year ?? DateTime.now().year;
+    final yearlyStats = await _getYearlyStats(friendUsername, actualYear);
+
     return {
       'myName': myDisplayName,
       'friendUsername': friendUsername,
@@ -36,6 +40,7 @@ class DualReportService {
       'year': year,
       'firstChat': firstChat,
       'thisYearFirstChat': thisYearFirstChat,
+      'yearlyStats': yearlyStats,
     };
   }
 
@@ -97,34 +102,22 @@ class DualReportService {
       final startTimestamp = 0; // 1970年1月1日
       final endTimestamp = now.millisecondsSinceEpoch ~/ 1000; // 当前时间
 
-      print('查询所有历史消息范围: $startTimestamp - $endTimestamp (${DateTime.fromMillisecondsSinceEpoch(startTimestamp*1000)} - ${DateTime.fromMillisecondsSinceEpoch(endTimestamp*1000)})');
       final allMessages = await _databaseService.getMessagesByDate(
         username,
         startTimestamp,
         endTimestamp,
       );
 
-      print('所有历史消息数量: ${allMessages.length}');
       if (allMessages.isEmpty) {
-        print('没有找到历史消息');
         return null;
       }
 
       // getMessagesByDate 返回的是降序（最新在前），需要按升序排序
       allMessages.sort((a, b) => a.createTime.compareTo(b.createTime));
 
-      // 调试：打印前5条消息的时间
-      print('排序后的前5条消息时间:');
-      for (int i = 0; i < (allMessages.length > 5 ? 5 : allMessages.length); i++) {
-        final msg = allMessages[i];
-        final timeMs = msg.createTime * 1000;
-        print('  [$i] ${msg.createTime} -> ${DateTime.fromMillisecondsSinceEpoch(timeMs)}');
-      }
-
       final firstMessage = allMessages.first;
       // createTime 是秒级时间戳，需要转换为毫秒
       final createTimeMs = firstMessage.createTime * 1000;
-      print('找到的第一条消息时间: ${firstMessage.createTime} -> ${DateTime.fromMillisecondsSinceEpoch(createTimeMs)}');
 
       return {
         'createTime': createTimeMs,  // 毫秒时间戳
@@ -134,7 +127,6 @@ class DualReportService {
         'senderUsername': firstMessage.senderUsername,
       };
     } catch (e) {
-      print('获取第一次聊天信息失败: $e');
       return null;
     }
   }
@@ -154,16 +146,13 @@ class DualReportService {
       final endTimestamp = endOfYear.millisecondsSinceEpoch ~/ 1000;
 
       // 直接按日期范围查询今年的消息
-      print('查询今年消息范围: $startTimestamp - $endTimestamp (${DateTime.fromMillisecondsSinceEpoch(startTimestamp*1000)} - ${DateTime.fromMillisecondsSinceEpoch(endTimestamp*1000)})');
       final thisYearMessages = await _databaseService.getMessagesByDate(
         username,
         startTimestamp,
         endTimestamp,
       );
 
-      print('今年消息数量: ${thisYearMessages.length}');
       if (thisYearMessages.isEmpty) {
-        print('今年没有找到消息');
         return null;
       }
 
@@ -171,7 +160,6 @@ class DualReportService {
       thisYearMessages.sort((a, b) => a.createTime.compareTo(b.createTime));
       final firstMessage = thisYearMessages.first;
       final createTimeMs = firstMessage.createTime * 1000; // 转换为毫秒
-      print('找到的今年第一条消息时间: ${firstMessage.createTime} -> ${DateTime.fromMillisecondsSinceEpoch(createTimeMs)}');
 
       // 获取前三条消息（包含时间）
       final firstThreeMessages = thisYearMessages.take(3).map((msg) {
@@ -193,7 +181,6 @@ class DualReportService {
         'firstThreeMessages': firstThreeMessages,
       };
     } catch (e) {
-      print('获取今年第一次聊天信息失败: $e');
       return null;
     }
   }
@@ -206,5 +193,138 @@ class DualReportService {
     final hour = dt.hour.toString().padLeft(2, '0');
     final minute = dt.minute.toString().padLeft(2, '0');
     return '$month/$day $hour:$minute';
+  }
+
+  /// 获取年度统计数据
+  Future<Map<String, dynamic>> _getYearlyStats(
+    String username,
+    int year,
+  ) async {
+    try {
+      // 定义今年的时间范围
+      final startOfYear = DateTime(year, 1, 1);
+      final endOfYear = DateTime(year, 12, 31, 23, 59, 59);
+
+      final startTimestamp = startOfYear.millisecondsSinceEpoch ~/ 1000;
+      final endTimestamp = endOfYear.millisecondsSinceEpoch ~/ 1000;
+
+      // 获取今年的所有消息
+      final messages = await _databaseService.getMessagesByDate(
+        username,
+        startTimestamp,
+        endTimestamp,
+      );
+
+      // 初始化统计
+      int totalMessages = 0;
+      int totalWords = 0;
+      int imageCount = 0;
+      int voiceCount = 0;
+      int emojiCount = 0;
+
+      for (final msg in messages) {
+        totalMessages++;
+
+        // 统计消息类型
+        switch (msg.localType) {
+          case 1: // 文本消息
+            // 统计字数（去除空白字符）
+            final content = msg.displayContent;
+            final words = content.trim().split(RegExp(r'\s+')).where((w) => w.isNotEmpty).length;
+            totalWords += words;
+            break;
+          case 3: // 图片
+            imageCount++;
+            break;
+          case 34: // 语音
+            voiceCount++;
+            break;
+          case 47: // 动画表情
+            emojiCount++;
+            break;
+        }
+      }
+
+      return {
+        'totalMessages': totalMessages,
+        'totalWords': totalWords,
+        'imageCount': imageCount,
+        'voiceCount': voiceCount,
+        'emojiCount': emojiCount,
+      };
+    } catch (e) {
+      print('获取年度统计数据失败: $e');
+      return {
+        'totalMessages': 0,
+        'totalWords': 0,
+        'imageCount': 0,
+        'voiceCount': 0,
+        'emojiCount': 0,
+      };
+    }
+  }
+
+  /// 生成完整的双人报告（外部接口）
+  Future<Map<String, dynamic>> generateDualReport({
+    required String friendUsername,
+    int? filterYear,
+  }) async {
+    try {
+      // 获取当前用户wxid
+      final myWxid = _databaseService.currentAccountWxid;
+      if (myWxid == null || myWxid.isEmpty) {
+        throw Exception('无法获取当前用户信息');
+      }
+
+      // 获取好友显示名称
+      final contacts = await _databaseService.getAllContacts();
+      final friendContact = contacts.firstWhere(
+        (c) => c.contact.username == friendUsername,
+        orElse: () => contacts.firstWhere(
+          (c) => c.contact.username.contains(friendUsername) || friendUsername.contains(c.contact.username),
+          orElse: () => ContactRecord(
+            contact: Contact(
+              id: 0,
+              username: friendUsername,
+              localType: 0,
+              alias: '',
+              encryptUsername: '',
+              flag: 0,
+              deleteFlag: 0,
+              verifyFlag: 0,
+              remark: '',
+              remarkQuanPin: '',
+              remarkPinYinInitial: '',
+              nickName: '',
+              pinYinInitial: '',
+              quanPin: '',
+              bigHeadUrl: '',
+              smallHeadUrl: '',
+              headImgMd5: '',
+              chatRoomNotify: 0,
+              isInChatRoom: 0,
+              description: '',
+              extraBuffer: [],
+              chatRoomType: 0,
+            ),
+            source: ContactRecognitionSource.friend,
+            origin: ContactDataOrigin.unknown,
+          ),
+        ),
+      );
+
+      final friendName = friendContact.contact.displayName;
+
+      // 生成报告数据
+      return await generateDualReportData(
+        friendUsername: friendUsername,
+        friendName: friendName,
+        myName: myWxid,
+        year: filterYear,
+      );
+    } catch (e) {
+      print('生成双人报告失败: $e');
+      rethrow;
+    }
   }
 }

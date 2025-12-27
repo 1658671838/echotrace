@@ -40,6 +40,10 @@ class DualReportHtmlRenderer {
     final thisYearFirstChat = reportData['thisYearFirstChat'] as Map<String, dynamic>?;
     buffer.writeln(_buildSection('first-chat', _buildFirstChatBody(firstChat, thisYearFirstChat, myName, friendName)));
 
+    // 第三部分：年度统计
+    final yearlyStats = reportData['yearlyStats'] as Map<String, dynamic>?;
+    buffer.writeln(_buildSection('yearly-stats', _buildYearlyStatsBody(yearlyStats, myName, friendName, reportData['year'] as int? ?? DateTime.now().year)));
+
     buffer.writeln('</main>');
 
     // JavaScript
@@ -115,6 +119,10 @@ body {
 }
 
 .section.first-chat {
+  background: #FFFFFF;
+}
+
+.section.yearly-stats {
   background: #FFFFFF;
 }
 
@@ -347,6 +355,63 @@ body {
   </div>
 </div>
 $thisYearSection
+''';
+  }
+
+  /// 构建年度统计部分
+  static String _buildYearlyStatsBody(
+    Map<String, dynamic>? yearlyStats,
+    String myName,
+    String friendName,
+    int year,
+  ) {
+    if (yearlyStats == null) {
+      return '''
+<div class="label-text">年度统计</div>
+<div class="hero-title">暂无数据</div>
+''';
+    }
+
+    final totalMessages = yearlyStats['totalMessages'] as int? ?? 0;
+    final totalWords = yearlyStats['totalWords'] as int? ?? 0;
+    final imageCount = yearlyStats['imageCount'] as int? ?? 0;
+    final voiceCount = yearlyStats['voiceCount'] as int? ?? 0;
+    final emojiCount = yearlyStats['emojiCount'] as int? ?? 0;
+
+    // 格式化数字：千分位
+    String formatNumber(int n) {
+      return n.toString().replaceAllMapped(
+        RegExp(r'(\d{1,3})(?=(\d{3})+(?!\d))'),
+        (Match m) => '${m[1]},',
+      );
+    }
+
+
+    return '''
+<div class="label-text">年度统计</div>
+<div class="hero-title">${_escapeHtml(myName)} & ${_escapeHtml(friendName)}的$year年</div>
+<div class="info-card">
+  <div class="info-label">一共发出</div>
+  <div class="info-value">
+    <span class="highlight">${formatNumber(totalMessages)}</span> <span class="sub-highlight">条消息</span>
+  </div>
+  <div class="info-label">总计</div>
+  <div class="info-value">
+    <span class="highlight">${formatNumber(totalWords)}</span> <span class="sub-highlight">字</span>
+  </div>
+  <div class="info-label">图片</div>
+  <div class="info-value">
+    <span class="highlight">${formatNumber(imageCount)}</span> <span class="sub-highlight">张</span>
+  </div>
+  <div class="info-label">语音</div>
+  <div class="info-value">
+    <span class="highlight">${formatNumber(voiceCount)}</span> <span class="sub-highlight">条</span>
+  </div>
+  <div class="info-label">表情包</div>
+  <div class="info-value">
+    <span class="highlight">${formatNumber(emojiCount)}</span> <span class="sub-highlight">张</span>
+  </div>
+</div>
 ''';
   }
 

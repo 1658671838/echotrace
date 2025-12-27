@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../services/dual_report_service.dart';
+import '../services/dual_report_cache_service.dart';
 import '../providers/app_state.dart';
 import 'package:provider/provider.dart';
 import 'friend_selector_page.dart';
@@ -60,11 +61,28 @@ class _DualReportPageState extends State<DualReportPage> {
     required String friendUsername,
   }) async {
     try {
+      // 首先检查缓存
+      final cachedData = await DualReportCacheService.loadReport(friendUsername, null);
+      if (cachedData != null) {
+        // 使用缓存数据
+        if (!mounted) return;
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(
+            builder: (context) => DualReportDisplayPage(reportData: cachedData),
+          ),
+        );
+        return;
+      }
+
       // 生成完整的双人报告数据
       final reportData = await dualReportService.generateDualReport(
         friendUsername: friendUsername,
         filterYear: null,
       );
+
+      // 保存到缓存
+      await DualReportCacheService.saveReport(friendUsername, null, reportData);
 
       if (!mounted) return;
 
