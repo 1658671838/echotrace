@@ -1342,7 +1342,6 @@ class _DualReportSubPageState extends State<_DualReportSubPage> {
       } else {
         await _updateProgress('检查缓存', '已完成', 12);
         reportData = await _generateReportInIsolate(ranking);
-        _stripEmojiDataUrls(reportData);
         final cacheData = _cloneForCache(reportData);
         _stripEmojiDataUrls(cacheData);
         await DualReportCacheService.saveReport(
@@ -1580,6 +1579,14 @@ class _DualReportSubPageState extends State<_DualReportSubPage> {
   }
 
   
+  Map<String, dynamic> _cloneForCache(Map<String, dynamic> data) {
+    try {
+      return jsonDecode(jsonEncode(data)) as Map<String, dynamic>;
+    } catch (_) {
+      return Map<String, dynamic>.from(data);
+    }
+  }
+
   void _stripEmojiDataUrls(Map<String, dynamic> reportData) {
     final yearlyStats =
         (reportData['yearlyStats'] as Map?)?.cast<String, dynamic>();
@@ -1589,7 +1596,7 @@ class _DualReportSubPageState extends State<_DualReportSubPage> {
     reportData['yearlyStats'] = yearlyStats;
   }
 
-Future<void> _cacheTopEmojiAssets(Map<String, dynamic> reportData) async {
+  Future<void> _cacheTopEmojiAssets(Map<String, dynamic> reportData) async {
     try {
       final yearlyStats =
           (reportData['yearlyStats'] as Map?)?.cast<String, dynamic>() ??
