@@ -1,7 +1,11 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
+import 'package:http/http.dart' as http;
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 import 'package:syncfusion_flutter_xlsio/xlsio.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
@@ -9,8 +13,1089 @@ import '../models/message.dart';
 import '../models/chat_session.dart';
 import '../models/contact_record.dart';
 import '../utils/path_utils.dart';
+import 'config_service.dart';
 import 'database_service.dart';
+import 'image_decrypt_service.dart';
+import 'image_service.dart';
 import 'logger_service.dart';
+import 'voice_message_service.dart';
+
+class MediaExportOptions {
+  final bool exportImages;
+  final bool exportVoices;
+  final bool exportEmojis;
+  final String exportDir;
+  final String sessionUsername;
+  final String mediaDirName;
+  final ConfigService? configService;
+  final VoiceMessageService? voiceService;
+  final String? dataPath;
+  final void Function(MediaExportProgress progress)? onProgress;
+
+  const MediaExportOptions({
+    required this.exportImages,
+    required this.exportVoices,
+    required this.exportEmojis,
+    required this.exportDir,
+    required this.sessionUsername,
+    this.mediaDirName = 'media',
+    this.configService,
+    this.voiceService,
+    this.dataPath,
+    this.onProgress,
+  });
+
+  bool get enabled => exportImages || exportVoices || exportEmojis;
+
+  String get mediaRoot => p.join(exportDir, mediaDirName);
+}
+
+class _MediaExportItem {
+  final String relativePath;
+  final String kind;
+
+  const _MediaExportItem({
+    required this.relativePath,
+    required this.kind,
+  });
+}
+
+class MediaExportProgress {
+  final int exportedCount;
+  final int exportedImages;
+  final int exportedVoices;
+  final int exportedEmojis;
+  final String stage;
+  final String kind;
+  final bool success;
+
+  const MediaExportProgress({
+    required this.exportedCount,
+    required this.exportedImages,
+    required this.exportedVoices,
+    required this.exportedEmojis,
+    required this.stage,
+    required this.kind,
+    required this.success,
+  });
+}
+
+class _MediaExportHelper {
+  _MediaExportHelper(
+    this._databaseService,
+    this._options,
+  );
+
+  final DatabaseService _databaseService;
+  final MediaExportOptions _options;
+  final Map<String, _MediaExportItem> _cache = {};
+  final Map<String, String> _decryptedIndex = {};
+  final Map<String, List<String>> _datCandidatesCache = {};
+  final Map<String, Future<_MediaExportItem?>> _inflight = {};
+  final Map<String, Map<String, String>> _exportedIndex = {};
+  ImageService? _imageService;
+  bool _imageServiceReady = false;
+  bool _mediaDirsReady = false;
+  bool _prepared = false;
+  int _exportedCount = 0;
+  int _exportedImageCount = 0;
+  int _exportedVoiceCount = 0;
+  int _exportedEmojiCount = 0;
+
+  Future<void> prepareForMessages(
+    List<Message> messages, {
+    void Function(int done, int total, String stage)? onProgress,
+  }) async {
+    if (_prepared || messages.isEmpty) return;
+    await logger.info(
+      'ChatExportMedia',
+      'prepare start: messages=${messages.length} '
+      'images=${_options.exportImages} '
+      'voices=${_options.exportVoices} '
+      'emojis=${_options.exportEmojis}',
+    );
+    final tasks = <_MediaTask>[];
+    final seen = <String>{};
+    _notifyStage('索引媒体资源...');
+    onProgress?.call(0, 0, '索引媒体资源...');
+    for (final msg in messages) {
+      final task = _taskFromMessage(msg);
+      if (task == null) continue;
+      final dedupeKey = '${task.kind}:${task.key}';
+      if (!seen.add(dedupeKey)) continue;
+      tasks.add(task);
+    }
+    if (tasks.isEmpty) {
+      await logger.info('ChatExportMedia', 'no media tasks');
+      _prepared = true;
+      return;
+    }
+    final total = tasks.length;
+    _notifyStage('索引完成：$total 个媒体待处理');
+    await logger.info('ChatExportMedia', 'media tasks=$total');
+
+    final concurrency = _resolveConcurrency();
+    var done = 0;
+    var cursor = 0;
+    Future<void> worker() async {
+      while (true) {
+        final index = cursor;
+        if (index >= total) return;
+        cursor += 1;
+        final task = tasks[index];
+        await logger.debug(
+          'ChatExportMedia',
+          'task start kind=${task.kind} key=${task.key}',
+        );
+        try {
+          switch (task.kind) {
+            case 'image':
+              await _exportImage(task.message)
+                  .timeout(const Duration(minutes: 2));
+              break;
+            case 'voice':
+              await _exportVoice(task.message)
+                  .timeout(const Duration(minutes: 2));
+              break;
+            case 'emoji':
+              await _exportEmoji(task.message)
+                  .timeout(const Duration(minutes: 2));
+              break;
+            default:
+              break;
+          }
+        } on TimeoutException {
+          await logger.warning(
+            'ChatExportMedia',
+            'task timeout kind=${task.kind} key=${task.key}',
+          );
+        }
+        done += 1;
+        await logger.debug(
+          'ChatExportMedia',
+          'task done kind=${task.kind} key=${task.key} progress=$done/$total',
+        );
+        onProgress?.call(done, total, '处理媒体资源...');
+        await Future<void>.delayed(Duration.zero);
+      }
+    }
+
+    _notifyStage('开始并行处理媒体（并发 $concurrency）');
+    onProgress?.call(0, total, '处理媒体资源...');
+    await Future.wait(List.generate(concurrency, (_) => worker()));
+    await logger.info(
+      'ChatExportMedia',
+      'prepare done total=$total exported=$_exportedCount '
+      'voices=$_exportedVoiceCount images=$_exportedImageCount '
+      'emojis=$_exportedEmojiCount',
+    );
+    _prepared = true;
+  }
+
+  Future<_MediaExportItem?> exportForMessage(Message message) async {
+    if (message.isImageMessage && _options.exportImages) {
+      return _exportImage(message);
+    }
+    if (message.isVoiceMessage && _options.exportVoices) {
+      return _exportVoice(message);
+    }
+    if (message.localType == 47 && _options.exportEmojis) {
+      return _exportEmoji(message);
+    }
+    return null;
+  }
+
+  Future<void> _ensureMediaDirs() async {
+    if (_mediaDirsReady) return;
+    final mediaRoot = Directory(_options.mediaRoot);
+    if (!await mediaRoot.exists()) {
+      await mediaRoot.create(recursive: true);
+    }
+    for (final sub in const ['images', 'voices', 'emojis']) {
+      final dir = Directory(p.join(mediaRoot.path, sub));
+      if (!await dir.exists()) {
+        await dir.create(recursive: true);
+      }
+    }
+    await _buildExportedIndex();
+    _mediaDirsReady = true;
+  }
+
+  String _relativePath(String subDir, String fileName) {
+    final rel = p.join(_options.mediaDirName, subDir, fileName);
+    return rel.replaceAll('\\', '/');
+  }
+
+  Future<_MediaExportItem?> _exportImage(Message message) async {
+    final key =
+        message.imageMd5 ?? message.imageDatName ?? 'img_${message.localId}';
+    final inflightKey = 'image:$key';
+    final inflight = _inflight[inflightKey];
+    if (inflight != null) return await inflight;
+    if (_prepared) {
+      return _cache[key];
+    }
+    final future = _exportImageInternal(message, key);
+    _inflight[inflightKey] = future;
+    final result = await future;
+    _inflight.remove(inflightKey);
+    return result;
+  }
+
+  Future<_MediaExportItem?> _exportImageInternal(
+    Message message,
+    String key,
+  ) async {
+    await logger.debug(
+      'ChatExportMedia',
+      'image export start localId=${message.localId} md5=${message.imageMd5} '
+      'dat=${message.imageDatName}',
+    );
+    _notifyMediaProgress('image', success: false);
+    final cached = _cache[key];
+    if (cached != null) {
+      _notifyMediaProgress('image', success: true);
+      return cached;
+    }
+
+    await _ensureMediaDirs();
+    final exportedHit = _findExportedImageForMessage(message);
+    if (exportedHit != null) {
+      await logger.debug(
+        'ChatExportMedia',
+        'image export hit exported cache dest=$exportedHit',
+      );
+      _notifyMediaProgress('image', success: true);
+      final item = _MediaExportItem(
+        relativePath: _relativePath('images', p.basename(exportedHit)),
+        kind: 'image',
+      );
+      _cache[key] = item;
+      _cacheImageAliases(message, item);
+      return item;
+    }
+
+    final sourcePath = await _resolveImageSource(message);
+    if (sourcePath != null) {
+      final sourceFile = File(sourcePath);
+      if (await sourceFile.exists()) {
+        final baseName = _sanitizeFileName(p.basename(sourcePath));
+        final cachedExport = _findExported('images', baseName);
+        if (cachedExport != null) {
+          await logger.debug(
+            'ChatExportMedia',
+            'image export hit exported cache dest=$cachedExport',
+          );
+          _notifyMediaProgress('image', success: true);
+          final item = _MediaExportItem(
+            relativePath:
+                _relativePath('images', p.basename(cachedExport)),
+            kind: 'image',
+          );
+          _cache[key] = item;
+          return item;
+        }
+        final destPath =
+            await _copyWithUniqueName(sourceFile, 'images', baseName, key);
+        if (destPath != null) {
+          await logger.debug(
+            'ChatExportMedia',
+            'image export copied src=$sourcePath dest=$destPath',
+          );
+          _notifyMediaProgress('image', success: true);
+          final item = _MediaExportItem(
+            relativePath:
+                _relativePath('images', p.basename(destPath)),
+            kind: 'image',
+          );
+          _cache[key] = item;
+          _cacheImageAliases(message, item);
+          return item;
+        }
+      }
+    }
+
+    final decrypted = await _decryptImageToExport(message, key);
+    if (decrypted != null) {
+      final baseName = _sanitizeFileName(p.basename(decrypted));
+      final cachedExport = _findExported('images', baseName);
+      if (cachedExport != null) {
+        await logger.debug(
+          'ChatExportMedia',
+          'image export hit exported cache dest=$cachedExport',
+        );
+        _notifyMediaProgress('image', success: true);
+        final item = _MediaExportItem(
+          relativePath: _relativePath('images', p.basename(cachedExport)),
+          kind: 'image',
+        );
+        _cache[key] = item;
+        return item;
+      }
+      await logger.debug(
+        'ChatExportMedia',
+        'image export decrypted dest=$decrypted',
+      );
+      _notifyMediaProgress('image', success: true);
+      final item = _MediaExportItem(
+        relativePath: _relativePath('images', p.basename(decrypted)),
+        kind: 'image',
+      );
+      _cache[key] = item;
+      _cacheImageAliases(message, item);
+      return item;
+    }
+    return null;
+  }
+
+  Future<_MediaExportItem?> _exportVoice(Message message) async {
+    if (message.isSend == 1) return null;
+    final key = 'voice_${message.createTime}_${message.localId}';
+    final inflightKey = 'voice:$key';
+    final inflight = _inflight[inflightKey];
+    if (inflight != null) return await inflight;
+    if (_prepared) {
+      return _cache[key];
+    }
+    final future = _exportVoiceInternal(message, key);
+    _inflight[inflightKey] = future;
+    final result = await future;
+    _inflight.remove(inflightKey);
+    return result;
+  }
+
+  Future<_MediaExportItem?> _exportVoiceInternal(
+    Message message,
+    String key,
+  ) async {
+    await logger.debug(
+      'ChatExportMedia',
+      'voice export start localId=${message.localId} time=${message.createTime}',
+    );
+    _notifyMediaProgress('voice', success: false);
+    final cached = _cache[key];
+    if (cached != null) {
+      _notifyMediaProgress('voice', success: true);
+      return cached;
+    }
+
+    final voiceService = _options.voiceService;
+    if (voiceService == null) return null;
+    await _ensureMediaDirs();
+
+    final outputFile = await voiceService.getOutputFile(
+      message,
+      _options.sessionUsername,
+    );
+    final baseNameFromOutput = _sanitizeFileName(p.basename(outputFile.path));
+    final exportedPath = _findExported('voices', baseNameFromOutput);
+    if (exportedPath != null) {
+      await logger.debug(
+        'ChatExportMedia',
+        'voice export hit exported cache dest=$exportedPath',
+      );
+      _notifyMediaProgress('voice', success: true);
+      final item = _MediaExportItem(
+        relativePath: _relativePath('voices', p.basename(exportedPath)),
+        kind: 'voice',
+      );
+      _cache[key] = item;
+      return item;
+    }
+
+    File? voiceFile = await voiceService.findExistingVoiceFile(
+      message,
+      _options.sessionUsername,
+    );
+    if (voiceFile == null) {
+      _notifyStage('语音解码中... localId=${message.localId}');
+      final sw = Stopwatch()..start();
+      Timer? heartbeat;
+      heartbeat = Timer.periodic(const Duration(seconds: 5), (_) {
+        final secs = sw.elapsed.inSeconds;
+        _notifyStage('语音解码中... 已等待 ${secs}s');
+      });
+      try {
+        final decodeFuture = voiceService
+            .ensureVoiceDecoded(message, _options.sessionUsername)
+            // ignore: body_might_complete_normally_catch_error
+            .catchError((_) {});
+        await Future.any([
+          decodeFuture,
+          _waitForFileReady(outputFile, const Duration(seconds: 90)),
+        ]);
+        if (await outputFile.exists()) {
+          voiceFile = outputFile;
+        } else {
+          await logger.warning(
+            'ChatExportMedia',
+            'voice export decode timeout localId=${message.localId}',
+          );
+          return null;
+        }
+      } catch (_) {
+        await logger.warning(
+          'ChatExportMedia',
+          'voice export decode failed localId=${message.localId}',
+        );
+        heartbeat.cancel();
+        return null;
+      } finally {
+        heartbeat.cancel();
+        await logger.info(
+          'ChatExportMedia',
+          'voice decode duration localId=${message.localId} ms=${sw.elapsedMilliseconds}',
+        );
+      }
+    }
+    if (!await voiceFile.exists()) return null;
+
+    _notifyStage('正在复制语音...');
+    final baseName = _sanitizeFileName(p.basename(voiceFile.path));
+    final destPath =
+        await _copyWithUniqueName(voiceFile, 'voices', baseName, key);
+    if (destPath == null) return null;
+    await logger.debug(
+      'ChatExportMedia',
+      'voice export copied src=${voiceFile.path} dest=$destPath',
+    );
+    _notifyMediaProgress('voice', success: true);
+    final item = _MediaExportItem(
+      relativePath: _relativePath('voices', p.basename(destPath)),
+      kind: 'voice',
+    );
+    _cache[key] = item;
+    return item;
+  }
+
+  Future<void> _waitForFileReady(File file, Duration timeout) async {
+    final sw = Stopwatch()..start();
+    while (sw.elapsed < timeout) {
+      if (await file.exists()) return;
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+    }
+  }
+
+  Future<_MediaExportItem?> _exportEmoji(Message message) async {
+    final url = message.emojiCdnUrl ?? '';
+    final md5 = message.emojiMd5 ?? '';
+    final key = md5.isNotEmpty ? md5 : url.hashCode.toUnsigned(32).toString();
+    final inflightKey = 'emoji:$key';
+    final inflight = _inflight[inflightKey];
+    if (inflight != null) return await inflight;
+    if (_prepared) {
+      if (url.isEmpty && md5.isEmpty) return null;
+      return _cache[key];
+    }
+    final future = _exportEmojiInternal(message, url, md5, key);
+    _inflight[inflightKey] = future;
+    final result = await future;
+    _inflight.remove(inflightKey);
+    return result;
+  }
+
+  Future<_MediaExportItem?> _exportEmojiInternal(
+    Message message,
+    String url,
+    String md5,
+    String key,
+  ) async {
+    await logger.debug(
+      'ChatExportMedia',
+      'emoji export start localId=${message.localId} md5=${message.emojiMd5} url=${message.emojiCdnUrl}',
+    );
+    _notifyMediaProgress('emoji', success: false);
+    if (url.isEmpty && md5.isEmpty) return null;
+    final cached = _cache[key];
+    if (cached != null) {
+      _notifyMediaProgress('emoji', success: true);
+      return cached;
+    }
+
+    await _ensureMediaDirs();
+    final cachedExport = _findExported('emojis', key);
+    if (cachedExport != null) {
+      await logger.debug(
+        'ChatExportMedia',
+        'emoji export hit exported cache dest=$cachedExport',
+      );
+      _notifyMediaProgress('emoji', success: true);
+      final item = _MediaExportItem(
+        relativePath: _relativePath('emojis', p.basename(cachedExport)),
+        kind: 'emoji',
+      );
+      _cache[key] = item;
+      return item;
+    }
+    final existing = await _findCachedEmoji(md5, url);
+    if (existing != null) {
+      final baseName = _sanitizeFileName(p.basename(existing));
+      final existingExport = _findExported('emojis', baseName);
+      if (existingExport != null) {
+        await logger.debug(
+          'ChatExportMedia',
+          'emoji export hit exported cache dest=$existingExport',
+        );
+        _notifyMediaProgress('emoji', success: true);
+        final item = _MediaExportItem(
+          relativePath: _relativePath('emojis', p.basename(existingExport)),
+          kind: 'emoji',
+        );
+        _cache[key] = item;
+        return item;
+      }
+      final destPath =
+          await _copyWithUniqueName(File(existing), 'emojis', baseName, key);
+      if (destPath == null) return null;
+      await logger.debug(
+        'ChatExportMedia',
+        'emoji export copied src=$existing dest=$destPath',
+      );
+      _notifyMediaProgress('emoji', success: true);
+      final item = _MediaExportItem(
+        relativePath: _relativePath('emojis', p.basename(destPath)),
+        kind: 'emoji',
+      );
+      _cache[key] = item;
+      return item;
+    }
+
+    if (url.isEmpty) return null;
+    final baseForDownload =
+        md5.isNotEmpty ? md5 : url.hashCode.toUnsigned(32).toString();
+    final existingDownloaded = _findExported('emojis', baseForDownload);
+    if (existingDownloaded != null) {
+      await logger.debug(
+        'ChatExportMedia',
+        'emoji export hit exported cache dest=$existingDownloaded',
+      );
+      _notifyMediaProgress('emoji', success: true);
+      final item = _MediaExportItem(
+        relativePath: _relativePath('emojis', p.basename(existingDownloaded)),
+        kind: 'emoji',
+      );
+      _cache[key] = item;
+      return item;
+    }
+    final downloaded = await _downloadEmojiToExport(url, md5);
+    if (downloaded == null) return null;
+    await logger.debug(
+      'ChatExportMedia',
+      'emoji export downloaded dest=$downloaded',
+    );
+    _notifyMediaProgress('emoji', success: true);
+    final item = _MediaExportItem(
+      relativePath: _relativePath('emojis', p.basename(downloaded)),
+      kind: 'emoji',
+    );
+    _cache[key] = item;
+    return item;
+  }
+
+  Future<String?> _resolveImageSource(Message message) async {
+    final md5 = message.imageMd5;
+    if (md5 != null && md5.isNotEmpty) {
+      final path = await _getImagePathFromHardlink(md5);
+      if (path != null) return path;
+    }
+    final cachedPath = await _findDecryptedImage(message);
+    if (cachedPath != null) return cachedPath;
+    return null;
+  }
+
+  Future<String?> _getImagePathFromHardlink(String md5) async {
+    final dataPath = _options.dataPath ?? _databaseService.currentDataPath;
+    if (dataPath == null || dataPath.isEmpty) return null;
+    _imageService ??= ImageService();
+    if (!_imageServiceReady) {
+      await _imageService!.init(dataPath);
+      _imageServiceReady = true;
+    }
+    try {
+      return await _imageService!.getImagePath(md5, _options.sessionUsername);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<String?> _findDecryptedImage(Message message) async {
+    if (_decryptedIndex.isEmpty) {
+      await _buildDecryptedIndex();
+    }
+    final byDat = message.imageDatName?.toLowerCase();
+    if (byDat != null && _decryptedIndex.containsKey(byDat)) {
+      return _decryptedIndex[byDat];
+    }
+    final byMd5 = message.imageMd5?.toLowerCase();
+    if (byMd5 != null && _decryptedIndex.containsKey(byMd5)) {
+      return _decryptedIndex[byMd5];
+    }
+    return null;
+  }
+
+  Future<void> _buildDecryptedIndex() async {
+    try {
+      final docs = await getApplicationDocumentsDirectory();
+      final imagesRoot = Directory(p.join(docs.path, 'EchoTrace', 'Images'));
+      if (!await imagesRoot.exists()) return;
+      await for (final entity in imagesRoot.list(recursive: true)) {
+        if (entity is! File) continue;
+        final ext = p.extension(entity.path).toLowerCase();
+        if (!_isImageExtension(ext)) continue;
+        final base = p.basenameWithoutExtension(entity.path).toLowerCase();
+        _decryptedIndex.putIfAbsent(base, () => entity.path);
+      }
+    } catch (_) {}
+  }
+
+  bool _isImageExtension(String ext) {
+    return ext == '.jpg' ||
+        ext == '.jpeg' ||
+        ext == '.png' ||
+        ext == '.gif' ||
+        ext == '.webp';
+  }
+
+  Future<String?> _decryptImageToExport(Message message, String cacheKey) async {
+    final datName = message.imageDatName;
+    final config = _options.configService;
+    if (datName == null || datName.isEmpty || config == null) {
+      return null;
+    }
+
+    final basePath = (await config.getDatabasePath()) ?? '';
+    final rawWxid = await config.getManualWxid();
+    if (basePath.isEmpty || rawWxid == null || rawWxid.isEmpty) {
+      return null;
+    }
+
+    final accountDir = Directory(p.join(basePath, rawWxid));
+    if (!await accountDir.exists()) return null;
+
+    final candidates = await _findDatCandidates(accountDir, datName);
+    if (candidates.isEmpty) return null;
+
+    final xorKeyHex = await config.getImageXorKey();
+    if (xorKeyHex == null || xorKeyHex.isEmpty) return null;
+    final aesKeyHex = await config.getImageAesKey();
+    final xorKey = ImageDecryptService.hexToXorKey(xorKeyHex);
+    Uint8List? aesKey;
+    if (aesKeyHex != null && aesKeyHex.isNotEmpty) {
+      try {
+        aesKey = ImageDecryptService.hexToBytes16(aesKeyHex);
+      } catch (_) {
+        aesKey = null;
+      }
+    }
+
+    final targetBase = _sanitizeFileName(datName);
+    final existingExport = _findExportedByBase('images', targetBase);
+    if (existingExport != null) {
+      return existingExport;
+    }
+    final tempName = '${targetBase}_tmp.jpg';
+    final outputPath = p.join(_options.mediaRoot, 'images', tempName);
+    final outputFile = File(outputPath);
+
+    final decryptService = ImageDecryptService();
+    for (final datPath in candidates) {
+      try {
+        if (!await outputFile.exists()) {
+          await decryptService.decryptDatAutoAsync(
+            datPath,
+            outputPath,
+            xorKey,
+            aesKey,
+          );
+        }
+        if (!await outputFile.exists()) continue;
+        final ext = await _detectImageExtensionFromFile(outputFile);
+        final finalName = '$targetBase$ext';
+        final finalPath = p.join(_options.mediaRoot, 'images', finalName);
+        if (finalPath != outputPath) {
+          await outputFile.rename(finalPath);
+        }
+        _recordExported('images', finalPath);
+        return finalPath;
+      } catch (_) {
+        continue;
+      }
+    }
+    return null;
+  }
+
+  Future<List<String>> _findDatCandidates(
+    Directory accountDir,
+    String datName,
+  ) async {
+    final key = datName.toLowerCase();
+    if (_datCandidatesCache.containsKey(key)) {
+      return _datCandidatesCache[key]!;
+    }
+    final results = <String>[];
+    try {
+      await for (final entity in accountDir.list(recursive: true)) {
+        if (entity is! File) continue;
+        final lower = p.basename(entity.path).toLowerCase();
+        if (!lower.contains(key)) continue;
+        if (!lower.endsWith('.dat')) continue;
+        results.add(entity.path);
+        if (results.length >= 8) break;
+      }
+    } catch (_) {}
+    _datCandidatesCache[key] = results;
+    return results;
+  }
+
+  Future<String?> _findCachedEmoji(String md5, String url) async {
+    try {
+      final docs = await getApplicationDocumentsDirectory();
+      final emojiDir = Directory(p.join(docs.path, 'EchoTrace', 'Emojis'));
+      if (!await emojiDir.exists()) return null;
+      final base = md5.isNotEmpty ? md5 : url.hashCode.toUnsigned(32).toString();
+      for (final ext in const ['.gif', '.png', '.webp', '.jpg', '.jpeg']) {
+        final candidate = File(p.join(emojiDir.path, '$base$ext'));
+        if (await candidate.exists()) return candidate.path;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  Future<String?> _downloadEmojiToExport(String url, String md5) async {
+    try {
+      final response = await http.get(Uri.parse(url));
+      final bytes = response.bodyBytes;
+      if (response.statusCode != 200 || bytes.isEmpty) {
+        return null;
+      }
+      final contentType = response.headers['content-type'] ?? '';
+      final ext = _detectImageExtension(bytes) ?? _pickExtension(url, contentType);
+      final base =
+          md5.isNotEmpty ? md5 : url.hashCode.toUnsigned(32).toString();
+    final fileName = _sanitizeFileName('$base$ext');
+    final outPath = p.join(_options.mediaRoot, 'emojis', fileName);
+    final file = File(outPath);
+    await file.writeAsBytes(bytes, flush: true);
+      return outPath;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<String?> _copyWithUniqueName(
+    File source,
+    String subDir,
+    String baseName,
+    String cacheKey,
+  ) async {
+    final dir = p.join(_options.mediaRoot, subDir);
+    var candidate = _sanitizeFileName(baseName);
+    if (candidate.isEmpty) {
+      candidate = '${cacheKey}_${DateTime.now().millisecondsSinceEpoch}';
+    }
+    final exported = _findExported(subDir, candidate);
+    if (exported != null) {
+      return exported;
+    }
+    var destPath = p.join(dir, candidate);
+    var suffix = 1;
+    while (await File(destPath).exists()) {
+      if (_sameFilePath(source.path, destPath)) return destPath;
+      final ext = p.extension(candidate);
+      final stem = p.basenameWithoutExtension(candidate);
+      final next = '${stem}_$suffix$ext';
+      destPath = p.join(dir, next);
+      suffix += 1;
+    }
+    try {
+      final copied = await _copyFileWithTimeout(
+        source,
+        destPath,
+        const Duration(seconds: 20),
+      );
+      if (copied) {
+        _recordExported(subDir, destPath);
+        return destPath;
+      }
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  bool _sameFilePath(String a, String b) {
+    try {
+      return p.equals(a, b);
+    } catch (_) {
+      return a == b;
+    }
+  }
+
+  String _sanitizeFileName(String name) {
+    return name.replaceAll(RegExp(r'[<>:"/\\|?*]'), '_').trim();
+  }
+
+  Future<void> _buildExportedIndex() async {
+    if (_exportedIndex.isNotEmpty) return;
+    for (final sub in const ['images', 'voices', 'emojis']) {
+      final dir = Directory(p.join(_options.mediaRoot, sub));
+      if (!await dir.exists()) {
+        _exportedIndex[sub] = {};
+        continue;
+      }
+      final map = <String, String>{};
+      await for (final entity in dir.list(recursive: true)) {
+        if (entity is! File) continue;
+        final name = p.basename(entity.path);
+        map[name] = entity.path;
+      }
+      _exportedIndex[sub] = map;
+    }
+  }
+
+  String? _findExported(String subDir, String fileName) {
+    final map = _exportedIndex[subDir];
+    if (map == null || map.isEmpty) return null;
+    return map[fileName];
+  }
+
+  String? _findExportedByBase(String subDir, String baseName) {
+    final map = _exportedIndex[subDir];
+    if (map == null || map.isEmpty) return null;
+    final lower = baseName.toLowerCase();
+    for (final entry in map.entries) {
+      final name = p.basenameWithoutExtension(entry.key).toLowerCase();
+      if (name == lower) return entry.value;
+    }
+    return null;
+  }
+
+  void _recordExported(String subDir, String path) {
+    final map = _exportedIndex[subDir];
+    if (map == null) return;
+    map[p.basename(path)] = path;
+  }
+
+  String? _findExportedImageForMessage(Message message) {
+    final md5 = message.imageMd5;
+    if (md5 != null && md5.isNotEmpty) {
+      final byBase = _findExportedByBase('images', md5);
+      if (byBase != null) return byBase;
+    }
+    final dat = message.imageDatName;
+    if (dat != null && dat.isNotEmpty) {
+      final byBase = _findExportedByBase('images', dat);
+      if (byBase != null) return byBase;
+    }
+    return null;
+  }
+
+  void _cacheImageAliases(Message message, _MediaExportItem item) {
+    final md5 = message.imageMd5;
+    if (md5 != null && md5.isNotEmpty) {
+      _cache[md5] = item;
+    }
+    final dat = message.imageDatName;
+    if (dat != null && dat.isNotEmpty) {
+      _cache[dat] = item;
+    }
+  }
+
+  Future<bool> _copyFileWithTimeout(
+    File source,
+    String destPath,
+    Duration timeout,
+  ) async {
+    try {
+      await logger.debug(
+        'ChatExportMedia',
+        'copy start src=${source.path} dest=$destPath',
+      );
+      await source.copy(destPath).timeout(timeout);
+      await logger.debug(
+        'ChatExportMedia',
+        'copy done dest=$destPath',
+      );
+      return true;
+    } on TimeoutException {
+      await logger.warning(
+        'ChatExportMedia',
+        'copy timeout dest=$destPath',
+      );
+      return false;
+    } catch (e) {
+      await logger.warning(
+        'ChatExportMedia',
+        'copy failed dest=$destPath error=$e',
+      );
+      return false;
+    }
+  }
+
+  String? _detectImageExtension(List<int> bytes) {
+    if (bytes.length < 12) return null;
+    if (bytes[0] == 0x47 &&
+        bytes[1] == 0x49 &&
+        bytes[2] == 0x46 &&
+        bytes[3] == 0x38 &&
+        (bytes[4] == 0x37 || bytes[4] == 0x39) &&
+        bytes[5] == 0x61) {
+      return '.gif';
+    }
+    if (bytes[0] == 0x89 &&
+        bytes[1] == 0x50 &&
+        bytes[2] == 0x4E &&
+        bytes[3] == 0x47 &&
+        bytes[4] == 0x0D &&
+        bytes[5] == 0x0A &&
+        bytes[6] == 0x1A &&
+        bytes[7] == 0x0A) {
+      return '.png';
+    }
+    if (bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) {
+      return '.jpg';
+    }
+    if (bytes[0] == 0x52 &&
+        bytes[1] == 0x49 &&
+        bytes[2] == 0x46 &&
+        bytes[3] == 0x46 &&
+        bytes[8] == 0x57 &&
+        bytes[9] == 0x45 &&
+        bytes[10] == 0x42 &&
+        bytes[11] == 0x50) {
+      return '.webp';
+    }
+    return null;
+  }
+
+  Future<String> _detectImageExtensionFromFile(File file) async {
+    try {
+      final bytes = await file.openRead(0, 16).first;
+      return _detectImageExtension(bytes) ?? '.jpg';
+    } catch (_) {
+      return '.jpg';
+    }
+  }
+
+  String _pickExtension(String url, String contentType) {
+    final uriExt = p.extension(Uri.parse(url).path);
+    if (uriExt.isNotEmpty && uriExt.length <= 5) {
+      return uriExt;
+    }
+    final lower = contentType.toLowerCase();
+    if (lower.contains('png')) return '.png';
+    if (lower.contains('webp')) return '.webp';
+    if (lower.contains('jpeg') || lower.contains('jpg')) return '.jpg';
+    return '.gif';
+  }
+
+  void _notifyStage(String stage) {
+    final callback = _options.onProgress;
+    if (callback == null) return;
+    callback(
+      MediaExportProgress(
+        exportedCount: _exportedCount,
+        exportedImages: _exportedImageCount,
+        exportedVoices: _exportedVoiceCount,
+        exportedEmojis: _exportedEmojiCount,
+        stage: stage,
+        kind: '',
+        success: true,
+      ),
+    );
+  }
+
+  void _notifyMediaProgress(String kind, {required bool success}) {
+    final callback = _options.onProgress;
+    if (callback == null) return;
+    if (success) {
+      _exportedCount += 1;
+      switch (kind) {
+        case 'image':
+          _exportedImageCount += 1;
+          break;
+        case 'voice':
+          _exportedVoiceCount += 1;
+          break;
+        case 'emoji':
+          _exportedEmojiCount += 1;
+          break;
+      }
+    }
+    final stage =
+        '正在处理媒体：${_kindLabel(kind)}（总计 $_exportedCount 个，'
+        '语音 $_exportedVoiceCount / 图片 $_exportedImageCount / 表情 $_exportedEmojiCount）';
+    callback(
+      MediaExportProgress(
+        exportedCount: _exportedCount,
+        exportedImages: _exportedImageCount,
+        exportedVoices: _exportedVoiceCount,
+        exportedEmojis: _exportedEmojiCount,
+        stage: stage,
+        kind: kind,
+        success: success,
+      ),
+    );
+  }
+
+  String _kindLabel(String kind) {
+    switch (kind) {
+      case 'image':
+        return '图片';
+      case 'voice':
+        return '语音';
+      case 'emoji':
+        return '表情';
+      default:
+        return '媒体';
+    }
+  }
+
+  int _resolveConcurrency() {
+    try {
+      final cpu = Platform.numberOfProcessors;
+      final base = (cpu / 2).floor();
+      if (base < 2) return 2;
+      if (base > 6) return 6;
+      return base;
+    } catch (_) {
+      return 3;
+    }
+  }
+
+  _MediaTask? _taskFromMessage(Message msg) {
+    if (msg.isImageMessage && _options.exportImages) {
+      final key =
+          msg.imageMd5 ?? msg.imageDatName ?? 'img_${msg.localId}';
+      return _MediaTask(kind: 'image', key: key, message: msg);
+    }
+    if (msg.isVoiceMessage && _options.exportVoices) {
+      if (msg.isSend == 1) return null;
+      final key = 'voice_${msg.createTime}_${msg.localId}';
+      return _MediaTask(kind: 'voice', key: key, message: msg);
+    }
+    if (msg.localType == 47 && _options.exportEmojis) {
+      final url = msg.emojiCdnUrl ?? '';
+      final md5 = msg.emojiMd5 ?? '';
+      if (url.isEmpty && md5.isEmpty) return null;
+      final key = md5.isNotEmpty ? md5 : url.hashCode.toUnsigned(32).toString();
+      return _MediaTask(kind: 'emoji', key: key, message: msg);
+    }
+    return null;
+  }
+}
+
+class _MediaTask {
+  final String kind;
+  final String key;
+  final Message message;
+
+  const _MediaTask({
+    required this.kind,
+    required this.key,
+    required this.message,
+  });
+}
 
 /// 聊天记录导出服务
 class ChatExportService {
@@ -137,6 +1222,7 @@ class ChatExportService {
     List<Message> messages, {
     String? filePath,
     void Function(int current, int total, String stage)? onProgress,
+    MediaExportOptions? mediaOptions,
   }) async {
     try {
       final totalMessages = messages.length;
@@ -182,6 +1268,21 @@ class ChatExportService {
       );
 
       onProgress?.call(0, totalMessages, '处理消息数据...');
+      final mediaHelper = (mediaOptions != null && mediaOptions.enabled)
+          ? _MediaExportHelper(_databaseService, mediaOptions)
+          : null;
+      if (mediaHelper != null) {
+        onProgress?.call(0, totalMessages, '处理媒体资源...');
+        await mediaHelper.prepareForMessages(
+          messages,
+          onProgress: (done, total, _) {
+            if (total <= 0) return;
+            final ratio = done / total;
+            final current = (totalMessages * 0.2 * ratio).round();
+            onProgress?.call(current, totalMessages, '处理媒体资源...');
+          },
+        );
+      }
 
       // 分批处理消息以显示进度
       final messageItems = <Map<String, dynamic>>[];
@@ -209,13 +1310,17 @@ class ChatExportService {
             myWxid: myWxid,
           );
 
+          final mediaItem = mediaHelper == null
+              ? null
+              : await mediaHelper.exportForMessage(msg);
+          final content = _resolveExportContent(msg, mediaItem);
           final item = <String, dynamic>{
             'localId': msg.localId,
             'createTime': msg.createTime,
             'formattedTime': msg.formattedCreateTime,
             'type': msg.typeDescription,
             'localType': msg.localType,
-            'content': msg.displayContent,
+            'content': content,
             'isSend': msg.isSend,
             'senderUsername': senderWxid.isEmpty ? null : senderWxid,
             'senderDisplayName': senderName,
@@ -223,8 +1328,11 @@ class ChatExportService {
             'source': msg.source,
           };
 
-          if (msg.localType == 47) {
+          if (msg.localType == 47 && msg.emojiMd5 != null) {
             item['emojiMd5'] = msg.emojiMd5;
+          }
+          if (mediaItem != null) {
+            item['mediaPath'] = mediaItem.relativePath;
           }
 
           messageItems.add(item);
@@ -252,6 +1360,9 @@ class ChatExportService {
         'avatars': avatars,
         'exportTime': DateTime.now().toIso8601String(),
       };
+      if (mediaOptions != null && mediaOptions.enabled) {
+        data['mediaBase'] = mediaOptions.mediaDirName;
+      }
 
       onProgress?.call(totalMessages, totalMessages, '编码 JSON...');
       await logger.info(
@@ -293,6 +1404,7 @@ class ChatExportService {
     List<Message> messages, {
     String? filePath,
     void Function(int current, int total, String stage)? onProgress,
+    MediaExportOptions? mediaOptions,
   }) async {
     try {
       final totalMessages = messages.length;
@@ -339,20 +1451,57 @@ class ChatExportService {
         myDisplayName: myDisplayName,
       );
 
+      final mediaHelper = (mediaOptions != null && mediaOptions.enabled)
+          ? _MediaExportHelper(_databaseService, mediaOptions)
+          : null;
+      if (mediaHelper != null) {
+        onProgress?.call(0, totalMessages, '处理媒体资源...');
+        await mediaHelper.prepareForMessages(
+          messages,
+          onProgress: (done, total, _) {
+            if (total <= 0) return;
+            final ratio = done / total;
+            final current = (totalMessages * 0.2 * ratio).round();
+            onProgress?.call(current, totalMessages, '处理媒体资源...');
+          },
+        );
+      }
+
       onProgress?.call(0, totalMessages, '生成 HTML...');
       await logger.info(
         'ChatExportService',
         'exportToHtml: 开始生成 HTML, 消息数: ${messages.length}',
       );
 
-      final html = _generateHtml(
-        session,
-        messages,
-        senderDisplayNames,
-        myWxid,
-        contactInfo,
-        myDisplayName,
-        avatars,
+      final messagesData = <Map<String, dynamic>>[];
+      for (int i = 0; i < messages.length; i++) {
+        final msg = messages[i];
+        final mediaItem = mediaHelper == null
+            ? null
+            : await mediaHelper.exportForMessage(msg);
+        final item = _buildHtmlMessageData(
+          msg: msg,
+          session: session,
+          senderDisplayNames: senderDisplayNames,
+          myWxid: myWxid,
+          contactInfo: contactInfo,
+          myDisplayName: myDisplayName,
+          mediaItem: mediaItem,
+        );
+        messagesData.add(item);
+        if ((i + 1) % 500 == 0 || i == messages.length - 1) {
+          onProgress?.call(i + 1, totalMessages, '生成 HTML...');
+        }
+      }
+
+      final html = _generateHtmlFromData(
+        session: session,
+        messagesData: messagesData,
+        contactInfo: contactInfo,
+        avatarIndex: avatars,
+        mediaBase: mediaOptions != null && mediaOptions.enabled
+            ? mediaOptions.mediaDirName
+            : null,
       );
 
       await logger.info(
@@ -387,6 +1536,7 @@ class ChatExportService {
     List<Message> messages, {
     String? filePath,
     void Function(int current, int total, String stage)? onProgress,
+    MediaExportOptions? mediaOptions,
   }) async {
     final Workbook workbook = Workbook();
     final totalMessages = messages.length;
@@ -485,6 +1635,22 @@ class ChatExportService {
         senderContactInfos[rawAccountWxidTrimmed] = currentAccountInfo;
       }
 
+      final mediaHelper = (mediaOptions != null && mediaOptions.enabled)
+          ? _MediaExportHelper(_databaseService, mediaOptions)
+          : null;
+      if (mediaHelper != null) {
+        onProgress?.call(0, totalMessages, '处理媒体资源...');
+        await mediaHelper.prepareForMessages(
+          messages,
+          onProgress: (done, total, _) {
+            if (total <= 0) return;
+            final ratio = done / total;
+            final current = (totalMessages * 0.2 * ratio).round();
+            onProgress?.call(current, totalMessages, '处理媒体资源...');
+          },
+        );
+      }
+
       // 添加数据行
       for (int i = 0; i < messages.length; i++) {
         final msg = messages[i];
@@ -518,6 +1684,11 @@ class ChatExportService {
 
         senderWxid = _sanitizeUsername(senderWxid);
 
+        final mediaItem = mediaHelper == null
+            ? null
+            : await mediaHelper.exportForMessage(msg);
+        final exportContent = _resolveExportContent(msg, mediaItem);
+
         sheet.getRangeByIndex(currentRow, 1).setNumber(i + 1);
         _setTextSafe(sheet, currentRow, 2, msg.formattedCreateTime);
         _setTextSafe(sheet, currentRow, 3, senderNickname);
@@ -525,7 +1696,7 @@ class ChatExportService {
         _setTextSafe(sheet, currentRow, 5, senderRemark);
         _setTextSafe(sheet, currentRow, 6, senderRole);
         _setTextSafe(sheet, currentRow, 7, msg.typeDescription);
-        _setTextSafe(sheet, currentRow, 8, msg.displayContent);
+        _setTextSafe(sheet, currentRow, 8, exportContent);
         currentRow++;
 
         // 每 500 条报告一次进度
@@ -597,6 +1768,7 @@ class ChatExportService {
     List<Message> messages, {
     String? filePath,
     void Function(int current, int total, String stage)? onProgress,
+    MediaExportOptions? mediaOptions,
   }) async {
     try {
       final totalMessages = messages.length;
@@ -651,6 +1823,22 @@ class ChatExportService {
         senderContactInfos[rawAccountWxidTrimmed] = currentAccountInfo;
       }
 
+      final mediaHelper = (mediaOptions != null && mediaOptions.enabled)
+          ? _MediaExportHelper(_databaseService, mediaOptions)
+          : null;
+      if (mediaHelper != null) {
+        onProgress?.call(0, totalMessages, '处理媒体资源...');
+        await mediaHelper.prepareForMessages(
+          messages,
+          onProgress: (done, total, _) {
+            if (total <= 0) return;
+            final ratio = done / total;
+            final current = (totalMessages * 0.2 * ratio).round();
+            onProgress?.call(current, totalMessages, '处理媒体资源...');
+          },
+        );
+      }
+
       onProgress?.call(0, totalMessages, '生成 SQL...');
       final buffer = StringBuffer();
 
@@ -696,7 +1884,11 @@ class ChatExportService {
           final timeStr =
               '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}:${dt.second.toString().padLeft(2, '0')}';
           final isSendBool = msg.isSend == 1 ? 'true' : 'false';
-          final contentEscaped = msg.displayContent.replaceAll("'", "''");
+          final mediaItem = mediaHelper == null
+              ? null
+              : await mediaHelper.exportForMessage(msg);
+          final exportContent = _resolveExportContent(msg, mediaItem);
+          final contentEscaped = exportContent.replaceAll("'", "''");
           final sendNameEscaped = senderNickname.replaceAll("'", "''");
           final timestampStr = '$dateStr $timeStr';
 
@@ -747,6 +1939,7 @@ class ChatExportService {
     int begintimestamp = 0,
     int endTimestamp = 0,
     int totalMessagesHint = 0,
+    MediaExportOptions? mediaOptions,
   }) async {
     IOSink? sink;
     try {
@@ -809,6 +2002,10 @@ class ChatExportService {
       sink.writeln('  "session": ${jsonEncode(sessionData)},');
       sink.write('  "messages": [');
 
+      final mediaHelper = (mediaOptions != null && mediaOptions.enabled)
+          ? _MediaExportHelper(_databaseService, mediaOptions)
+          : null;
+
       var isFirst = true;
       var processed = 0;
       await _databaseService.exportSessionMessages(
@@ -821,6 +2018,9 @@ class ChatExportService {
           );
           await _ensureSenderDisplayNames(newUsernames, senderDisplayNames);
           for (final msg in batch) {
+            final mediaItem = mediaHelper == null
+                ? null
+                : await mediaHelper.exportForMessage(msg);
             final item = _buildJsonMessageItem(
               msg: msg,
               session: session,
@@ -830,6 +2030,7 @@ class ChatExportService {
               rawMyWxid: rawMyWxid,
               myDisplayName: myDisplayName,
               myWxid: myWxid,
+              mediaItem: mediaItem,
             );
             final encoded = jsonEncode(item);
             if (!isFirst) {
@@ -859,6 +2060,9 @@ class ChatExportService {
 
       sink.write('\n  ],\n');
       sink.writeln('  "avatars": ${jsonEncode(avatars)},');
+      if (mediaOptions != null && mediaOptions.enabled) {
+        sink.writeln('  "mediaBase": "${mediaOptions.mediaDirName}",');
+      }
       sink.writeln('  "exportTime": "$exportTime"');
       sink.writeln('}');
 
@@ -882,6 +2086,7 @@ class ChatExportService {
     int begintimestamp = 0,
     int endTimestamp = 0,
     int totalMessagesHint = 0,
+    MediaExportOptions? mediaOptions,
   }) async {
     IOSink? sink;
     try {
@@ -938,6 +2143,10 @@ class ChatExportService {
 
       var isFirst = true;
       var processed = 0;
+      final mediaHelper = (mediaOptions != null && mediaOptions.enabled)
+          ? _MediaExportHelper(_databaseService, mediaOptions)
+          : null;
+
       await _databaseService.exportSessionMessages(
         session.username,
         (batch) async {
@@ -948,6 +2157,9 @@ class ChatExportService {
           );
           await _ensureSenderDisplayNames(newUsernames, senderDisplayNames);
           for (final msg in batch) {
+            final mediaItem = mediaHelper == null
+                ? null
+                : await mediaHelper.exportForMessage(msg);
             final item = _buildHtmlMessageData(
               msg: msg,
               session: session,
@@ -955,6 +2167,7 @@ class ChatExportService {
               myWxid: myWxid,
               contactInfo: contactInfo,
               myDisplayName: myDisplayName,
+              mediaItem: mediaItem,
             );
             final encoded = jsonEncode(item);
             if (!isFirst) {
@@ -1005,6 +2218,7 @@ class ChatExportService {
     int begintimestamp = 0,
     int endTimestamp = 0,
     int totalMessagesHint = 0,
+    MediaExportOptions? mediaOptions,
   }) async {
     final Workbook workbook = Workbook();
     try {
@@ -1074,6 +2288,10 @@ class ChatExportService {
         senderContactInfos[trimmedAccountWxid] = currentAccountInfo;
       }
 
+      final mediaHelper = (mediaOptions != null && mediaOptions.enabled)
+          ? _MediaExportHelper(_databaseService, mediaOptions)
+          : null;
+
       var index = 0;
       await _databaseService.exportSessionMessages(
         session.username,
@@ -1115,6 +2333,11 @@ class ChatExportService {
 
             senderWxid = _sanitizeUsername(senderWxid);
 
+            final mediaItem = mediaHelper == null
+                ? null
+                : await mediaHelper.exportForMessage(msg);
+            final exportContent = _resolveExportContent(msg, mediaItem);
+
             sheet.getRangeByIndex(currentRow, 1).setNumber(index.toDouble());
             _setTextSafe(sheet, currentRow, 2, msg.formattedCreateTime);
             _setTextSafe(sheet, currentRow, 3, senderNickname);
@@ -1122,7 +2345,7 @@ class ChatExportService {
             _setTextSafe(sheet, currentRow, 5, senderRemark);
             _setTextSafe(sheet, currentRow, 6, senderRole);
             _setTextSafe(sheet, currentRow, 7, msg.typeDescription);
-            _setTextSafe(sheet, currentRow, 8, msg.displayContent);
+            _setTextSafe(sheet, currentRow, 8, exportContent);
             currentRow++;
           }
 
@@ -1207,6 +2430,7 @@ class ChatExportService {
     int begintimestamp = 0,
     int endTimestamp = 0,
     int totalMessagesHint = 0,
+    MediaExportOptions? mediaOptions,
   }) async {
     IOSink? sink;
     try {
@@ -1243,6 +2467,10 @@ class ChatExportService {
       if (trimmedAccountWxid.isNotEmpty) {
         senderContactInfos[trimmedAccountWxid] = currentAccountInfo;
       }
+
+      final mediaHelper = (mediaOptions != null && mediaOptions.enabled)
+          ? _MediaExportHelper(_databaseService, mediaOptions)
+          : null;
 
       if (filePath == null) {
         final suggestedName =
@@ -1314,7 +2542,11 @@ class ChatExportService {
             final timeStr =
                 '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}:${dt.second.toString().padLeft(2, '0')}';
             final isSendBool = msg.isSend == 1 ? 'true' : 'false';
-            final contentEscaped = msg.displayContent.replaceAll("'", "''");
+            final mediaItem = mediaHelper == null
+                ? null
+                : await mediaHelper.exportForMessage(msg);
+            final exportContent = _resolveExportContent(msg, mediaItem);
+            final contentEscaped = exportContent.replaceAll("'", "''");
             final sendNameEscaped = senderNickname.replaceAll("'", "''");
             final timestampStr = '$dateStr $timeStr';
 
@@ -1352,56 +2584,14 @@ class ChatExportService {
     }
   }
 
-  /// 生成 HTML 内容
-  String _generateHtml(
-    ChatSession session,
-    List<Message> messages,
-    Map<String, String> senderDisplayNames,
-    String myWxid,
-    Map<String, String> contactInfo,
-    String myDisplayName,
-    Map<String, Map<String, String>> avatarIndex,
-  ) {
+  String _generateHtmlFromData({
+    required ChatSession session,
+    required List<Map<String, dynamic>> messagesData,
+    required Map<String, String> contactInfo,
+    required Map<String, Map<String, String>> avatarIndex,
+    required String? mediaBase,
+  }) {
     final buffer = StringBuffer();
-
-    // 构建消息数据
-    final messagesData = messages.map((msg) {
-      final msgDate = DateTime.fromMillisecondsSinceEpoch(
-        msg.createTime * 1000,
-      );
-      final isSend = msg.isSend == 1;
-
-      String senderName = '';
-      if (!isSend && session.isGroup && msg.senderUsername != null) {
-        senderName = senderDisplayNames[msg.senderUsername] ?? '群成员';
-      } else if (!isSend) {
-        senderName = _resolvePreferredName(
-          contactInfo,
-          fallback: session.displayName ?? session.username,
-        );
-      } else {
-        senderName = myDisplayName;
-      }
-      final avatarKey = _resolveSenderUsername(
-        msg: msg,
-        session: session,
-        isSend: isSend,
-        myWxid: myWxid,
-      );
-
-      return {
-        'date':
-            '${msgDate.year}-${msgDate.month.toString().padLeft(2, '0')}-${msgDate.day.toString().padLeft(2, '0')}',
-        'time':
-            '${msgDate.hour.toString().padLeft(2, '0')}:${msgDate.minute.toString().padLeft(2, '0')}:${msgDate.second.toString().padLeft(2, '0')}',
-        'isSend': isSend,
-        'content': msg.displayContent,
-        'senderName': senderName,
-        'timestamp': msg.createTime,
-        'avatarKey': avatarKey.isEmpty ? null : avatarKey,
-      };
-    }).toList();
-
     buffer.writeln('<!DOCTYPE html>');
     buffer.writeln('<html lang="zh-CN">');
     buffer.writeln('<head>');
@@ -1424,7 +2614,6 @@ class ChatExportService {
       '        <h1>${_escapeHtml(session.displayName ?? session.username)}</h1>',
     );
 
-    // 添加详细信息菜单按钮
     final nickname = contactInfo['nickname'] ?? '';
     final remark = _getRemarkOrAlias(contactInfo);
     final sanitizedSessionWxid = _sanitizeUsername(session.username);
@@ -1446,8 +2635,6 @@ class ChatExportService {
       buffer.writeln('          </svg>');
       buffer.writeln('        </button>');
       buffer.writeln('      </div>');
-
-      // 详细信息下拉菜单
       buffer.writeln('      <div class="info-menu" id="info-menu">');
       buffer.writeln('        <div class="info-menu-content">');
       if (sanitizedSessionWxid.isNotEmpty) {
@@ -1482,7 +2669,10 @@ class ChatExportService {
 
     buffer.writeln('      <div class="info">');
     buffer.writeln('        <span>${session.typeDescription}</span>');
-    buffer.writeln('        <span>共 ${messages.length} 条消息</span>');
+    buffer.writeln('        <span>共 ${messagesData.length} 条消息</span>');
+    if (mediaBase != null) {
+      buffer.writeln('        <span>媒体目录: $mediaBase</span>');
+    }
     buffer.writeln(
       '        <span>导出时间: ${DateTime.now().toString().split('.')[0]}</span>',
     );
@@ -1495,8 +2685,6 @@ class ChatExportService {
       '    <div class="scroll-to-bottom" id="scroll-to-bottom" title="回到底部">↓</div>',
     );
     buffer.writeln('  </div>');
-
-    // 将消息数据嵌入为JSON
     buffer.writeln('  <script>');
     buffer.writeln('    const messagesData = ${jsonEncode(messagesData)};');
     buffer.writeln('    const avatarIndex = ${jsonEncode(avatarIndex)};');
@@ -1506,199 +2694,138 @@ class ChatExportService {
     buffer.writeln('    let isLoading = false;');
     buffer.writeln('    let allLoaded = false;');
     buffer.writeln('    ');
-    buffer.writeln('    function createMessageElement(msg, showDate) {');
+    buffer.writeln('    const TIME_GAP_SECONDS = 300;');
+    buffer.writeln('    let lastShownTimestamp = null;');
+    buffer.writeln('    function shouldShowTime(ts) {');
+    buffer.writeln('      if (lastShownTimestamp === null) {');
+    buffer.writeln('        lastShownTimestamp = ts;');
+    buffer.writeln('        return true;');
+    buffer.writeln('      }');
+    buffer.writeln('      if (Math.abs(ts - lastShownTimestamp) >= TIME_GAP_SECONDS) {');
+    buffer.writeln('        lastShownTimestamp = ts;');
+    buffer.writeln('        return true;');
+    buffer.writeln('      }');
+    buffer.writeln('      return false;');
+    buffer.writeln('    }');
+    buffer.writeln('    function createMessageElement(msg, showDate, showTime) {');
     buffer.writeln('      const fragment = document.createDocumentFragment();');
-    buffer.writeln('      ');
-    buffer.writeln('      // 日期分隔符');
-    buffer.writeln('      if (showDate) {');
-    buffer.writeln('        const dateSep = document.createElement("div");');
-    buffer.writeln('        dateSep.className = "date-separator";');
-    buffer.writeln('        dateSep.textContent = msg.date;');
-    buffer.writeln('        fragment.appendChild(dateSep);');
+    buffer.writeln('      if (showDate || showTime) {');
+    buffer.writeln('        const dateDivider = document.createElement("div");');
+    buffer.writeln('        dateDivider.className = "date-divider";');
+    buffer.writeln('        dateDivider.textContent = showDate ? msg.date : msg.time;');
+    buffer.writeln('        fragment.appendChild(dateDivider);');
     buffer.writeln('      }');
-    buffer.writeln('      ');
-    buffer.writeln('      // 消息项');
-    buffer.writeln('      const messageItem = document.createElement("div");');
+    buffer.writeln('      const messageEl = document.createElement("div");');
     buffer.writeln(
-      '      messageItem.className = msg.isSend ? "message-item sent" : "message-item received";',
+      '      messageEl.className = `message-item \${msg.isSend ? "sent" : "received"}`;',
     );
-    buffer.writeln('      ');
-    buffer.writeln('      // 发送者名称');
-    buffer.writeln('      if (msg.senderName) {');
-    buffer.writeln('        const senderName = document.createElement("div");');
-    buffer.writeln('        senderName.className = "sender-name";');
-    buffer.writeln('        senderName.textContent = msg.senderName;');
-    buffer.writeln('        messageItem.appendChild(senderName);');
-    buffer.writeln('      }');
-    buffer.writeln('      ');
-    buffer.writeln('      // 消息气泡');
-    buffer.writeln('      const bubble = document.createElement("div");');
-    buffer.writeln('      bubble.className = "message-bubble";');
-    buffer.writeln('      ');
-    buffer.writeln('      const content = document.createElement("div");');
-    buffer.writeln('      content.className = "content";');
-    buffer.writeln('      content.textContent = msg.content;');
-    buffer.writeln('      bubble.appendChild(content);');
-    buffer.writeln('      ');
-    buffer.writeln('      const time = document.createElement("div");');
-    buffer.writeln('      time.className = "time";');
-    buffer.writeln('      time.textContent = msg.time;');
-    buffer.writeln('      bubble.appendChild(time);');
-    buffer.writeln('      ');
-    buffer.writeln('      messageItem.appendChild(bubble);');
-    buffer.writeln('      fragment.appendChild(messageItem);');
-    buffer.writeln('      ');
+    buffer.writeln(
+      '      const avatarHtml = msg.avatarKey && avatarIndex[msg.avatarKey] ?',
+    );
+    buffer.writeln(
+      '        `<div class="avatar"><img src="data:image/png;base64,\${avatarIndex[msg.avatarKey].base64}" alt="\${avatarIndex[msg.avatarKey].displayName}"/></div>` :',
+    );
+    buffer.writeln('        `<div class="avatar placeholder"></div>`;');
+    buffer.writeln('      const bubbleClass = msg.isMedia ? "message-bubble media" : "message-bubble";');
+    buffer.writeln(
+      '      messageEl.innerHTML = `<div class="message-row">\${avatarHtml}<div class="\${bubbleClass}"><div class="content">\${msg.content}</div></div></div>`;',
+    );
+    buffer.writeln('      messageEl.setAttribute("data-time", msg.timeTooltip || msg.time);');
+    buffer.writeln('      fragment.appendChild(messageEl);');
     buffer.writeln('      return fragment;');
     buffer.writeln('    }');
     buffer.writeln('    ');
-    buffer.writeln('    function loadInitialMessages() {');
-    buffer.writeln(
-      '      const container = document.getElementById("messages-container");',
-    );
-    buffer.writeln(
-      '      const loading = container.querySelector(".loading");',
-    );
-    buffer.writeln('      if (loading) loading.remove();');
-    buffer.writeln('      ');
-    buffer.writeln('      // 加载最新的消息');
-    buffer.writeln(
-      '      const start = Math.max(0, messagesData.length - INITIAL_BATCH);',
-    );
+    buffer.writeln('    function renderMessages(start, end, toTop = true) {');
+    buffer.writeln('      const container = document.getElementById("messages-container");');
+    buffer.writeln('      if (!container) return;');
     buffer.writeln('      const fragment = document.createDocumentFragment();');
     buffer.writeln('      let lastDate = null;');
-    buffer.writeln('      ');
-    buffer.writeln('      for (let i = start; i < messagesData.length; i++) {');
+    buffer.writeln('      for (let i = start; i < end; i++) {');
     buffer.writeln('        const msg = messagesData[i];');
     buffer.writeln('        const showDate = msg.date !== lastDate;');
-    buffer.writeln(
-      '        fragment.appendChild(createMessageElement(msg, showDate));',
-    );
+    buffer.writeln('        const showTime = shouldShowTime(msg.timestamp);');
     buffer.writeln('        lastDate = msg.date;');
+    buffer.writeln('        fragment.appendChild(createMessageElement(msg, showDate, showTime));');
     buffer.writeln('      }');
-    buffer.writeln('      ');
-    buffer.writeln('      container.appendChild(fragment);');
+    buffer.writeln('      if (toTop) {');
+    buffer.writeln('        container.insertBefore(fragment, container.firstChild);');
+    buffer.writeln('      } else {');
+    buffer.writeln('        container.appendChild(fragment);');
+    buffer.writeln('      }');
+    buffer.writeln('    }');
+    buffer.writeln('    ');
+    buffer.writeln('    function loadInitialMessages() {');
+    buffer.writeln('      const container = document.getElementById("messages-container");');
+    buffer.writeln('      if (!container) return;');
+    buffer.writeln('      container.innerHTML = "";');
+    buffer.writeln('      const start = Math.max(0, messagesData.length - INITIAL_BATCH);');
+    buffer.writeln('      renderMessages(start, messagesData.length, false);');
     buffer.writeln('      loadedStart = start;');
-    buffer.writeln('      allLoaded = loadedStart === 0;');
-    buffer.writeln('      ');
-    buffer.writeln('      // 立即滚动到底部');
-    buffer.writeln('      container.scrollTop = container.scrollHeight;');
+    buffer.writeln('      updateScrollButton();');
+    buffer.writeln('      scrollToBottom();');
     buffer.writeln('    }');
     buffer.writeln('    ');
     buffer.writeln('    function loadMoreMessages() {');
     buffer.writeln('      if (isLoading || allLoaded) return;');
-    buffer.writeln('      ');
     buffer.writeln('      isLoading = true;');
-    buffer.writeln(
-      '      const container = document.getElementById("messages-container");',
-    );
-    buffer.writeln('      const oldHeight = container.scrollHeight;');
-    buffer.writeln('      const oldScroll = container.scrollTop;');
-    buffer.writeln('      ');
-    buffer.writeln('      // 加载更早的消息');
-    buffer.writeln(
-      '      const start = Math.max(0, loadedStart - BATCH_SIZE);',
-    );
-    buffer.writeln('      const fragment = document.createDocumentFragment();');
-    buffer.writeln('      let lastDate = null;');
-    buffer.writeln('      ');
-    buffer.writeln('      for (let i = start; i < loadedStart; i++) {');
-    buffer.writeln('        const msg = messagesData[i];');
-    buffer.writeln('        const showDate = msg.date !== lastDate;');
-    buffer.writeln(
-      '        fragment.appendChild(createMessageElement(msg, showDate));',
-    );
-    buffer.writeln('        lastDate = msg.date;');
+    buffer.writeln('      const nextStart = Math.max(0, loadedStart - BATCH_SIZE);');
+    buffer.writeln('      if (nextStart === loadedStart) {');
+    buffer.writeln('        allLoaded = true;');
+    buffer.writeln('        isLoading = false;');
+    buffer.writeln('        return;');
     buffer.writeln('      }');
-    buffer.writeln('      ');
-    buffer.writeln(
-      '      container.insertBefore(fragment, container.firstChild);',
-    );
-    buffer.writeln('      loadedStart = start;');
-    buffer.writeln('      allLoaded = loadedStart === 0;');
-    buffer.writeln('      ');
-    buffer.writeln('      // 保持滚动位置');
-    buffer.writeln(
-      '      container.scrollTop = oldScroll + (container.scrollHeight - oldHeight);',
-    );
+    buffer.writeln('      const oldScrollHeight = document.getElementById("messages-container").scrollHeight;');
+    buffer.writeln('      renderMessages(nextStart, loadedStart, true);');
+    buffer.writeln('      const newScrollHeight = document.getElementById("messages-container").scrollHeight;');
+    buffer.writeln('      document.getElementById("messages-container").scrollTop = newScrollHeight - oldScrollHeight;');
+    buffer.writeln('      loadedStart = nextStart;');
     buffer.writeln('      isLoading = false;');
+    buffer.writeln('      if (loadedStart === 0) {');
+    buffer.writeln('        allLoaded = true;');
+    buffer.writeln('      }');
     buffer.writeln('    }');
     buffer.writeln('    ');
-    buffer.writeln('    // 滚动监听');
-    buffer.writeln(
-      '    const scrollBtn = document.getElementById("scroll-to-bottom");',
-    );
-    buffer.writeln(
-      '    const messagesContainer = document.getElementById("messages-container");',
-    );
+    buffer.writeln('    function scrollToBottom() {');
+    buffer.writeln('      const container = document.getElementById("messages-container");');
+    buffer.writeln('      if (!container) return;');
+    buffer.writeln('      container.scrollTop = container.scrollHeight;');
+    buffer.writeln('    }');
     buffer.writeln('    ');
-    buffer.writeln('    messagesContainer.addEventListener("scroll", () => {');
-    buffer.writeln('      // 接近顶部时加载更多历史消息');
-    buffer.writeln(
-      '      if (messagesContainer.scrollTop < 200 && !allLoaded) {',
-    );
+    buffer.writeln('    function updateScrollButton() {');
+    buffer.writeln('      const container = document.getElementById("messages-container");');
+    buffer.writeln('      const button = document.getElementById("scroll-to-bottom");');
+    buffer.writeln('      if (!container || !button) return;');
+    buffer.writeln('      const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 120;');
+    buffer.writeln('      button.style.display = nearBottom ? "none" : "flex";');
+    buffer.writeln('    }');
+    buffer.writeln('    ');
+    buffer.writeln('    document.getElementById("messages-container").addEventListener("scroll", () => {');
+    buffer.writeln('      if (document.getElementById("messages-container").scrollTop === 0) {');
     buffer.writeln('        loadMoreMessages();');
     buffer.writeln('      }');
-    buffer.writeln('      ');
-    buffer.writeln('      // 显示/隐藏回到底部按钮');
-    buffer.writeln(
-      '      const isBottom = messagesContainer.scrollHeight - messagesContainer.scrollTop <= messagesContainer.clientHeight + 100;',
-    );
-    buffer.writeln(
-      '      scrollBtn.style.display = isBottom ? "none" : "flex";',
-    );
+    buffer.writeln('      updateScrollButton();');
     buffer.writeln('    });');
     buffer.writeln('    ');
-    buffer.writeln('    scrollBtn.addEventListener("click", () => {');
-    buffer.writeln(
-      '      messagesContainer.scrollTo({ top: messagesContainer.scrollHeight, behavior: "smooth" });',
-    );
-    buffer.writeln('    });');
+    buffer.writeln('    document.getElementById("scroll-to-bottom").addEventListener("click", scrollToBottom);');
     buffer.writeln('    ');
-    buffer.writeln('    // 详细信息菜单控制');
-    buffer.writeln('    function toggleInfoMenu() {');
-    buffer.writeln('      const menu = document.getElementById("info-menu");');
-    buffer.writeln('      if (!menu) return;');
-    buffer.writeln('      menu.classList.toggle("show");');
-    buffer.writeln('    }');
-    buffer.writeln('    ');
-    buffer.writeln('    function hideInfoMenu() {');
-    buffer.writeln('      const menu = document.getElementById("info-menu");');
-    buffer.writeln('      if (menu) {');
-    buffer.writeln('        menu.classList.remove("show");');
-    buffer.writeln('      }');
-    buffer.writeln('    }');
-    buffer.writeln('    ');
-    buffer.writeln('    // 点击外部关闭菜单');
-    buffer.writeln('    document.addEventListener("click", (e) => {');
-    buffer.writeln('      const menu = document.getElementById("info-menu");');
-    buffer.writeln(
-      '      const btn = document.getElementById("info-menu-btn");',
-    );
-    buffer.writeln(
-      '      if (menu && btn && !menu.contains(e.target) && !btn.contains(e.target)) {',
-    );
-    buffer.writeln('        menu.classList.remove("show");');
-    buffer.writeln('      }');
-    buffer.writeln('    });');
-    buffer.writeln('    ');
-    buffer.writeln(
-      '    const infoMenuBtn = document.getElementById("info-menu-btn");',
-    );
-    buffer.writeln('    if (infoMenuBtn) {');
-    buffer.writeln('      infoMenuBtn.addEventListener("click", (event) => {');
-    buffer.writeln('        event.stopPropagation();');
-    buffer.writeln('        toggleInfoMenu();');
+    buffer.writeln('    if (document.getElementById("info-menu-btn")) {');
+    buffer.writeln('      document.getElementById("info-menu-btn").addEventListener("click", () => {');
+    buffer.writeln('        document.getElementById("info-menu").classList.toggle("show");');
+    buffer.writeln('      });');
+    buffer.writeln('      document.addEventListener("click", (event) => {');
+    buffer.writeln('        const menu = document.getElementById("info-menu");');
+    buffer.writeln('        const btn = document.getElementById("info-menu-btn");');
+    buffer.writeln('        if (!menu || !btn) return;');
+    buffer.writeln('        if (!menu.contains(event.target) && !btn.contains(event.target)) {');
+    buffer.writeln('          menu.classList.remove("show");');
+    buffer.writeln('        }');
     buffer.writeln('      });');
     buffer.writeln('    }');
     buffer.writeln('    ');
-    buffer.writeln('    // 初始加载');
-    buffer.writeln('    window.addEventListener("DOMContentLoaded", () => {');
-    buffer.writeln('      loadInitialMessages();');
-    buffer.writeln('    });');
+    buffer.writeln('    loadInitialMessages();');
     buffer.writeln('  </script>');
     buffer.writeln('</body>');
     buffer.writeln('</html>');
-
     return buffer.toString();
   }
 
@@ -1821,6 +2948,26 @@ class ChatExportService {
     return merged;
   }
 
+  String _resolveExportContent(Message msg, _MediaExportItem? mediaItem) {
+    if (mediaItem == null) return msg.displayContent;
+    return mediaItem.relativePath;
+  }
+
+  String _formatHtmlContent(Message msg, _MediaExportItem? mediaItem) {
+    if (mediaItem == null) return _escapeHtml(msg.displayContent);
+    final path = _escapeHtml(mediaItem.relativePath);
+    switch (mediaItem.kind) {
+      case 'image':
+        return '<img class="message-media image" src="$path" alt="图片" />';
+      case 'emoji':
+        return '<img class="message-media emoji" src="$path" alt="表情" />';
+      case 'voice':
+        return '<audio class="message-media voice" controls src="$path"></audio>';
+      default:
+        return msg.displayContent;
+    }
+  }
+
   Map<String, dynamic> _buildJsonMessageItem({
     required Message msg,
     required ChatSession session,
@@ -1830,6 +2977,7 @@ class ChatExportService {
     required String rawMyWxid,
     required String myDisplayName,
     required String myWxid,
+    _MediaExportItem? mediaItem,
   }) {
     final isSend = msg.isSend == 1;
     final senderName = _resolveSenderDisplayName(
@@ -1847,6 +2995,7 @@ class ChatExportService {
       isSend: isSend,
       myWxid: myWxid,
     );
+    final content = _resolveExportContent(msg, mediaItem);
 
     final item = <String, dynamic>{
       'localId': msg.localId,
@@ -1854,7 +3003,7 @@ class ChatExportService {
       'formattedTime': msg.formattedCreateTime,
       'type': msg.typeDescription,
       'localType': msg.localType,
-      'content': msg.displayContent,
+      'content': content,
       'isSend': msg.isSend,
       'senderUsername': senderWxid.isEmpty ? null : senderWxid,
       'senderDisplayName': senderName,
@@ -1862,8 +3011,11 @@ class ChatExportService {
       'source': msg.source,
     };
 
-    if (msg.localType == 47) {
+    if (msg.localType == 47 && msg.emojiMd5 != null) {
       item['emojiMd5'] = msg.emojiMd5;
+    }
+    if (mediaItem != null) {
+      item['mediaPath'] = mediaItem.relativePath;
     }
 
     return item;
@@ -1876,6 +3028,7 @@ class ChatExportService {
     required String myWxid,
     required Map<String, String> contactInfo,
     required String myDisplayName,
+    _MediaExportItem? mediaItem,
   }) {
     final msgDate = DateTime.fromMillisecondsSinceEpoch(
       msg.createTime * 1000,
@@ -1905,8 +3058,12 @@ class ChatExportService {
           '${msgDate.year}-${msgDate.month.toString().padLeft(2, '0')}-${msgDate.day.toString().padLeft(2, '0')}',
       'time':
           '${msgDate.hour.toString().padLeft(2, '0')}:${msgDate.minute.toString().padLeft(2, '0')}:${msgDate.second.toString().padLeft(2, '0')}',
+      'timeTooltip':
+          '${msgDate.year}-${msgDate.month.toString().padLeft(2, '0')}-${msgDate.day.toString().padLeft(2, '0')} '
+          '${msgDate.hour.toString().padLeft(2, '0')}:${msgDate.minute.toString().padLeft(2, '0')}:${msgDate.second.toString().padLeft(2, '0')}',
       'isSend': isSend,
-      'content': msg.displayContent,
+      'isMedia': mediaItem != null,
+      'content': _formatHtmlContent(msg, mediaItem),
       'senderName': senderName,
       'timestamp': msg.createTime,
       'avatarKey': avatarKey.isEmpty ? null : avatarKey,
@@ -2022,17 +3179,30 @@ class ChatExportService {
     buffer.writeln('    let isLoading = false;');
     buffer.writeln('    let allLoaded = false;');
     buffer.writeln('    ');
-    buffer.writeln('    function createMessageElement(msg, showDate) {');
+    buffer.writeln('    const TIME_GAP_SECONDS = 300;');
+    buffer.writeln('    let lastShownTimestamp = null;');
+    buffer.writeln('    function shouldShowTime(ts) {');
+    buffer.writeln('      if (lastShownTimestamp === null) {');
+    buffer.writeln('        lastShownTimestamp = ts;');
+    buffer.writeln('        return true;');
+    buffer.writeln('      }');
+    buffer.writeln('      if (Math.abs(ts - lastShownTimestamp) >= TIME_GAP_SECONDS) {');
+    buffer.writeln('        lastShownTimestamp = ts;');
+    buffer.writeln('        return true;');
+    buffer.writeln('      }');
+    buffer.writeln('      return false;');
+    buffer.writeln('    }');
+    buffer.writeln('    function createMessageElement(msg, showDate, showTime) {');
     buffer.writeln('      const fragment = document.createDocumentFragment();');
-    buffer.writeln('      if (showDate) {');
+    buffer.writeln('      if (showDate || showTime) {');
     buffer.writeln('        const dateDivider = document.createElement("div");');
     buffer.writeln('        dateDivider.className = "date-divider";');
-    buffer.writeln('        dateDivider.textContent = msg.date;');
+    buffer.writeln('        dateDivider.textContent = showDate ? msg.date : msg.time;');
     buffer.writeln('        fragment.appendChild(dateDivider);');
     buffer.writeln('      }');
     buffer.writeln('      const messageEl = document.createElement("div");');
     buffer.writeln(
-      '      messageEl.className = `message \${msg.isSend ? "sent" : "received"}`;',
+      '      messageEl.className = `message-item \${msg.isSend ? "sent" : "received"}`;',
     );
     buffer.writeln(
       '      const avatarHtml = msg.avatarKey && avatarIndex[msg.avatarKey] ?',
@@ -2041,9 +3211,11 @@ class ChatExportService {
       '        `<div class="avatar"><img src="data:image/png;base64,\${avatarIndex[msg.avatarKey].base64}" alt="\${avatarIndex[msg.avatarKey].displayName}"/></div>` :',
     );
     buffer.writeln('        `<div class="avatar placeholder"></div>`;');
+    buffer.writeln('      const bubbleClass = msg.isMedia ? "message-bubble media" : "message-bubble";');
     buffer.writeln(
-      '      messageEl.innerHTML = `\${avatarHtml}<div class="bubble"><div class="sender">\${msg.senderName}</div><div class="content">\${msg.content}</div><div class="time">\${msg.time}</div></div>`;',
+      '      messageEl.innerHTML = `<div class="message-row">\${avatarHtml}<div class="\${bubbleClass}"><div class="content">\${msg.content}</div></div></div>`;',
     );
+    buffer.writeln('      messageEl.setAttribute("data-time", msg.timeTooltip || msg.time);');
     buffer.writeln('      fragment.appendChild(messageEl);');
     buffer.writeln('      return fragment;');
     buffer.writeln('    }');
@@ -2056,8 +3228,9 @@ class ChatExportService {
     buffer.writeln('      for (let i = start; i < end; i++) {');
     buffer.writeln('        const msg = messagesData[i];');
     buffer.writeln('        const showDate = msg.date !== lastDate;');
+    buffer.writeln('        const showTime = shouldShowTime(msg.timestamp);');
     buffer.writeln('        lastDate = msg.date;');
-    buffer.writeln('        fragment.appendChild(createMessageElement(msg, showDate));');
+    buffer.writeln('        fragment.appendChild(createMessageElement(msg, showDate, showTime));');
     buffer.writeln('      }');
     buffer.writeln('      if (toTop) {');
     buffer.writeln('        container.insertBefore(fragment, container.firstChild);');
@@ -2070,6 +3243,7 @@ class ChatExportService {
     buffer.writeln('      const container = document.getElementById("messages-container");');
     buffer.writeln('      if (!container) return;');
     buffer.writeln('      container.innerHTML = "";');
+    buffer.writeln('      lastShownTimestamp = null;');
     buffer.writeln(
       '      const start = Math.max(0, messagesData.length - INITIAL_BATCH);',
     );
@@ -2835,12 +4009,82 @@ class ChatExportService {
         letter-spacing: 0.3px;
         backdrop-filter: blur(10px);
       }
+
+      .date-divider {
+        text-align: center;
+        color: #8b8b8b;
+        font-size: 12px;
+        margin: 22px auto;
+        padding: 6px 14px;
+        display: inline-block;
+        background: #f1f1f1;
+        border-radius: 999px;
+        font-weight: 500;
+        letter-spacing: 0.2px;
+        box-shadow: 0 1px 0 rgba(0, 0, 0, 0.05);
+        position: relative;
+        left: 50%;
+        transform: translateX(-50%);
+      }
       
       .message-item {
         margin-bottom: 20px;
         display: flex;
         flex-direction: column;
+        position: relative;
+        width: 100%;
+        padding: 4px 0;
         animation: slideIn 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+      }
+
+      .message-item::after {
+        content: attr(data-time);
+        position: absolute;
+        top: -22px;
+        max-width: 70%;
+        padding: 4px 10px;
+        border-radius: 12px;
+        background: rgba(0, 0, 0, 0.65);
+        color: #fff;
+        font-size: 11px;
+        opacity: 0;
+        pointer-events: none;
+        transform: translateY(4px);
+        transition: opacity 0.2s ease, transform 0.2s ease;
+        white-space: nowrap;
+      }
+
+      .message-item.sent::after {
+        right: 46px;
+      }
+
+      .message-item.received::after {
+        left: 46px;
+      }
+
+      .message-item:hover::after {
+        opacity: 1;
+        transform: translateY(0);
+      }
+
+      .avatar {
+        width: 36px;
+        height: 36px;
+        border-radius: 50%;
+        overflow: hidden;
+        flex-shrink: 0;
+        background: rgba(255, 255, 255, 0.6);
+      }
+
+      .avatar img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        display: block;
+      }
+
+      .avatar.placeholder {
+        background: rgba(255, 255, 255, 0.45);
       }
       
       @keyframes slideIn {
@@ -2860,6 +4104,38 @@ class ChatExportService {
       
       .message-item.received {
         align-items: flex-start;
+      }
+
+      .message-bubble.media {
+        background: transparent;
+        box-shadow: none;
+        border: none;
+        padding: 0;
+        min-width: auto;
+      }
+
+      .message-bubble.media::after {
+        display: none;
+      }
+
+      .message-bubble.media:hover {
+        transform: none;
+        box-shadow: none;
+      }
+
+      .message-row {
+        display: flex;
+        align-items: flex-end;
+        gap: 10px;
+        width: 100%;
+      }
+
+      .message-item.sent .message-row {
+        flex-direction: row-reverse;
+      }
+
+      .message-item.sent .sender-name {
+        text-align: right;
       }
       
       .sender-name {
@@ -2931,6 +4207,18 @@ class ChatExportService {
         border-bottom: 6px solid transparent;
         filter: drop-shadow(-2px 2px 2px rgba(0, 0, 0, 0.06));
       }
+
+      .sent .message-bubble.media,
+      .received .message-bubble.media {
+        background: transparent;
+        box-shadow: none;
+        border: none;
+      }
+
+      .sent .message-bubble.media::after,
+      .received .message-bubble.media::after {
+        display: none;
+      }
       
       .content {
         font-size: 15px;
@@ -2938,6 +4226,28 @@ class ChatExportService {
         word-wrap: break-word;
         white-space: pre-wrap;
         letter-spacing: 0.2px;
+      }
+
+      .message-media {
+        max-width: 240px;
+        border-radius: 12px;
+        display: block;
+      }
+
+      .message-media.image {
+        max-height: 240px;
+        object-fit: cover;
+      }
+
+      .message-media.emoji {
+        width: 120px;
+        height: 120px;
+        object-fit: contain;
+      }
+
+      .message-media.voice {
+        width: 220px;
+        height: 32px;
       }
       
       .time {
@@ -3294,4 +4604,3 @@ class ChatExportService {
         .replaceAll(RegExp(r'[ \t\r\n]+$'), '');
   }
 }
-
