@@ -506,10 +506,10 @@ $heatmap
     return '''
 <div class="label-text">曾经的好朋友</div>
 <div class="hero-title">时间都带我遇见了谁<br>又留下了些什么？</div>
-<div class="hero-desc"><br>你与 <span class="hl">${_escapeHtml(d['displayName'])}</span> 曾经连续聊了 ${fmt.format(activeDays)} 天<br><br>只要好友还在，我们还记得彼此<br>总有一天，我们会再次相见</div>
+<div class="hero-desc"><br>你与 <span class="hl">${_escapeHtml(d['displayName'])}</span> 曾经连续聊了 ${fmt.format(activeDays)} 天<br>（${_formatDate(d['activeStartDate'])} 至 ${_formatDate(d['activeEndDate'])}）<br><br>只要好友还在，我们还记得彼此<br>总有一天，我们会再次相见</div>
 <div class="data-grid">
   <div><div class="label-text">曾经</div><div class="item-name">${fmt.format(activeDaysCount)} 天</div><div class="item-val">产生 ${fmt.format(messageCount)} 条回忆</div></div>
-  <div><div class="label-text">离别已</div><div class="item-name">${fmt.format(daysSince)} 天</div><div class="item-val">最后活跃于 ${_formatDate(d['activeEndDate'])}</div></div>
+  <div><div class="label-text">离别已</div><div class="item-name">${fmt.format(daysSince)} 天</div><div class="item-val">最后一次对话于 ${_formatDate(d['lastMessageDate'] ?? d['activeEndDate'])}</div></div>
 </div>
 ''';
   }
