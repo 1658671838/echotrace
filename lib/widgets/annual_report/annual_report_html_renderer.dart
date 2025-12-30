@@ -471,7 +471,7 @@ section.page.visible .content-wrapper {
       final displayName = (data['displayName'] as String?)?.trim();
       final name = (displayName == null || displayName.isEmpty) ? '暂无' : displayName;
       final avatarUrl = (data['avatarUrl'] as String?) ?? '';
-      final index = month % 12;
+      final index = month - 1;
       items.add('''
 <div class="monthly-item" style="--i: $index;">
   <div class="month-label">${month}月</div>
