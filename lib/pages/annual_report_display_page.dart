@@ -17,6 +17,8 @@ class AnnualReportDisplayPage extends StatefulWidget {
   final int? year;
   final bool showAppBar;
   final VoidCallback? onClose;
+  final bool autoStart;
+  final Future<bool> Function()? onBeforeGenerate;
 
   const AnnualReportDisplayPage({
     super.key,
@@ -24,6 +26,8 @@ class AnnualReportDisplayPage extends StatefulWidget {
     this.year,
     this.showAppBar = true,
     this.onClose,
+    this.autoStart = true,
+    this.onBeforeGenerate,
   });
 
   @override
@@ -56,7 +60,9 @@ class _AnnualReportDisplayPageState extends State<AnnualReportDisplayPage> {
     super.initState();
     _keyboardFocusNode = FocusNode();
     _keyboardFocusNode.requestFocus();
-    _initializeReport();
+    if (widget.autoStart) {
+      _initializeReport();
+    }
   }
 
   @override
@@ -117,7 +123,7 @@ class _AnnualReportDisplayPageState extends State<AnnualReportDisplayPage> {
           if (shouldRegenerate == true) {
             // 重新生成
             await logger.info('AnnualReportPage', '用户选择重新生成');
-            await _startGenerateReport();
+            await _requestGenerateReport();
           } else {
             // 使用旧数据
             await logger.info('AnnualReportPage', '用户选择使用旧数据');
@@ -139,7 +145,7 @@ class _AnnualReportDisplayPageState extends State<AnnualReportDisplayPage> {
       '没有缓存或缓存无效，自动开始生成: hasCache=$hasCache, dbModifiedTime=$_dbModifiedTime',
     );
     // 自动生成缓存
-    await _startGenerateReport();
+    await _requestGenerateReport();
   }
 
   Future<bool?> _showDatabaseChangedDialog() async {
@@ -194,6 +200,7 @@ class _AnnualReportDisplayPageState extends State<AnnualReportDisplayPage> {
     }
 
     await logger.debug('AnnualReportPage', '设置生成状态为 true');
+    if (!mounted) return;
     setState(() {
       _isGenerating = true;
       _currentTaskName = '';
@@ -284,11 +291,19 @@ class _AnnualReportDisplayPageState extends State<AnnualReportDisplayPage> {
           duration: const Duration(seconds: 5),
           action: SnackBarAction(
             label: '重试',
-            onPressed: _startGenerateReport,
+            onPressed: _requestGenerateReport,
           ),
         ),
       );
     }
+  }
+
+  Future<void> _requestGenerateReport() async {
+    if (widget.onBeforeGenerate != null) {
+      final canStart = await widget.onBeforeGenerate!.call();
+      if (!canStart) return;
+    }
+    await _startGenerateReport();
   }
 
   Future<void> _applyReportData(Map<String, dynamic> data) async {
@@ -659,6 +674,7 @@ class _AnnualReportDisplayPageState extends State<AnnualReportDisplayPage> {
 
   Future<void> _openReportInBrowser() async {
     if (_reportHtml == null || _isOpeningBrowser) return;
+    if (!mounted) return;
     setState(() {
       _isOpeningBrowser = true;
     });
@@ -774,7 +790,9 @@ class _AnnualReportDisplayPageState extends State<AnnualReportDisplayPage> {
               ),
               const SizedBox(height: 48),
               ElevatedButton.icon(
-                onPressed: _startGenerateReport,
+                onPressed: () async {
+                  await _initializeReport();
+                },
                 icon: const Icon(Icons.play_arrow),
                 label: const Text('开始生成报告'),
                 style: ElevatedButton.styleFrom(

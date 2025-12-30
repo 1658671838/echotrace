@@ -7,6 +7,7 @@ import 'package:provider/provider.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:path/path.dart' as p;
 import '../providers/app_state.dart';
 import '../models/chat_session.dart';
 import '../models/contact_record.dart';
@@ -42,6 +43,10 @@ class _ChatExportPageState extends State<ChatExportPage>
   bool _hasAttemptedRefreshAfterConnect = false;
   bool _useAllTime = false;
   bool _isExportingContacts = false;
+  bool _exportMedia = false;
+  bool _exportImages = true;
+  bool _exportVoices = true;
+  bool _exportEmojis = true;
   late final TextEditingController _searchController;
   late final FocusNode _searchFocusNode;
 
@@ -392,6 +397,15 @@ class _ChatExportPageState extends State<ChatExportPage>
     final dateRangeText = _useAllTime
         ? '全部时间'
         : '${_selectedRange!.start.toLocal().toString().split(' ')[0]} 至 ${_selectedRange!.end.toLocal().toString().split(' ')[0]}';
+    final mediaSelections = <String>[];
+    if (_exportMedia) {
+      if (_exportImages) mediaSelections.add('图片');
+      if (_exportVoices) mediaSelections.add('语音');
+      if (_exportEmojis) mediaSelections.add('表情');
+    }
+    final mediaSummary = _exportMedia && mediaSelections.isNotEmpty
+        ? '媒体导出: ${mediaSelections.join(' / ')}\n导出方式: 子文件夹 + 相对路径\n'
+        : '';
 
     final confirmed = await showDialog<bool>(
       context: context,
@@ -401,6 +415,7 @@ class _ChatExportPageState extends State<ChatExportPage>
           '将导出 ${_selectedSessions.length} 个会话的聊天记录\n'
           '日期范围: $dateRangeText\n'
           '导出格式: ${_getFormatName(_selectedFormat)}\n'
+          '$mediaSummary'
           '导出位置: $_exportFolder\n\n'
           '此操作可能需要一些时间，请耐心等待。',
         ),
@@ -432,6 +447,10 @@ class _ChatExportPageState extends State<ChatExportPage>
         dateRange: _selectedRange!,
         exportFolder: _exportFolder!,
         useAllTime: _useAllTime,
+        exportMedia: _exportMedia,
+        exportImages: _exportImages,
+        exportVoices: _exportVoices,
+        exportEmojis: _exportEmojis,
       ),
     );
   }
@@ -1263,6 +1282,95 @@ class _ChatExportPageState extends State<ChatExportPage>
                       ),
                     ),
                   ),
+                  const SizedBox(height: 24),
+                  _buildSettingSection(
+                    title: '媒体文件',
+                    subtitle: '导出图片/语音/表情并在记录内写入相对路径',
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: Colors.grey.shade200),
+                      ),
+                      child: Column(
+                        children: [
+                          SwitchListTile(
+                            value: _exportMedia,
+                            onChanged: (v) => setState(() => _exportMedia = v),
+                            title: const Text(
+                              '导出媒体文件',
+                              style: TextStyle(fontSize: 14),
+                            ),
+                            subtitle: const Text(
+                              '会创建子文件夹并保存媒体资源',
+                              style: TextStyle(fontSize: 11),
+                            ),
+                            contentPadding: const EdgeInsets.symmetric(
+                              horizontal: 16,
+                            ),
+                            activeColor: Theme.of(context).colorScheme.primary,
+                          ),
+                          Divider(
+                            height: 1,
+                            indent: 16,
+                            color: Colors.grey.shade100,
+                          ),
+                          CheckboxListTile(
+                            value: _exportImages,
+                            onChanged: _exportMedia
+                                ? (v) => setState(() => _exportImages = v ?? false)
+                                : null,
+                            title: const Text('图片'),
+                            subtitle: const Text(
+                              '已有文件直接复制，缺失时尝试解密',
+                              style: TextStyle(fontSize: 11),
+                            ),
+                            contentPadding: const EdgeInsets.symmetric(
+                              horizontal: 16,
+                            ),
+                          ),
+                          Divider(
+                            height: 1,
+                            indent: 16,
+                            color: Colors.grey.shade100,
+                          ),
+                          CheckboxListTile(
+                            value: _exportVoices,
+                            onChanged: _exportMedia
+                                ? (v) => setState(() => _exportVoices = v ?? false)
+                                : null,
+                            title: const Text('语音'),
+                            subtitle: const Text(
+                              '缺失时会解码生成 MP3',
+                              style: TextStyle(fontSize: 11),
+                            ),
+                            contentPadding: const EdgeInsets.symmetric(
+                              horizontal: 16,
+                            ),
+                          ),
+                          Divider(
+                            height: 1,
+                            indent: 16,
+                            color: Colors.grey.shade100,
+                          ),
+                          CheckboxListTile(
+                            value: _exportEmojis,
+                            onChanged: _exportMedia
+                                ? (v) => setState(() => _exportEmojis = v ?? false)
+                                : null,
+                            title: const Text('表情'),
+                            subtitle: const Text(
+                              '本地无缓存时尝试下载',
+                              style: TextStyle(fontSize: 11),
+                            ),
+                            contentPadding: const EdgeInsets.symmetric(
+                              horizontal: 16,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
                   const SizedBox(height: 40),
                 ],
               ),
@@ -1379,6 +1487,10 @@ class _ExportProgressDialog extends StatefulWidget {
   final DateTimeRange dateRange;
   final String exportFolder;
   final bool useAllTime;
+  final bool exportMedia;
+  final bool exportImages;
+  final bool exportVoices;
+  final bool exportEmojis;
 
   const _ExportProgressDialog({
     required this.sessions,
@@ -1387,6 +1499,10 @@ class _ExportProgressDialog extends StatefulWidget {
     required this.dateRange,
     required this.exportFolder,
     required this.useAllTime,
+    required this.exportMedia,
+    required this.exportImages,
+    required this.exportVoices,
+    required this.exportEmojis,
   });
 
   @override
@@ -1406,6 +1522,8 @@ class _ExportProgressDialogState extends State<_ExportProgressDialog> {
 
   // 使用 ValueNotifier 来局部更新条数，避免重建整个 widget 导致进度条卡顿
   final ValueNotifier<int> _exportedCountNotifier = ValueNotifier<int>(0);
+  final ValueNotifier<int> _exportedMediaNotifier = ValueNotifier<int>(0);
+  final ValueNotifier<String> _mediaStageNotifier = ValueNotifier<String>('');
 
   @override
   void initState() {
@@ -1417,6 +1535,8 @@ class _ExportProgressDialogState extends State<_ExportProgressDialog> {
   @override
   void dispose() {
     _exportedCountNotifier.dispose();
+    _exportedMediaNotifier.dispose();
+    _mediaStageNotifier.dispose();
     super.dispose();
   }
 
@@ -1491,6 +1611,8 @@ class _ExportProgressDialogState extends State<_ExportProgressDialog> {
           _progress = totalToScan > 0 ? 0.0 : -1.0;
           _currentSessionName = displayName;
           _exportedCountNotifier.value = 0;
+          _exportedMediaNotifier.value = 0;
+          _mediaStageNotifier.value = '';
           _currentStage = '读取消息...';
         });
 
@@ -1551,8 +1673,37 @@ class _ExportProgressDialogState extends State<_ExportProgressDialog> {
         }
 
         final safeName = displayName.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
-        final savePath =
-            '${widget.exportFolder}/${safeName}_${DateTime.now().millisecondsSinceEpoch}.${widget.format}';
+        final timestamp = DateTime.now().millisecondsSinceEpoch;
+        final exportDir = widget.exportMedia
+            ? p.join(widget.exportFolder, '${safeName}_$timestamp')
+            : widget.exportFolder;
+        if (widget.exportMedia) {
+          await Directory(exportDir).create(recursive: true);
+        }
+        final savePath = widget.exportMedia
+            ? p.join(exportDir, '$safeName.${widget.format}')
+            : p.join(widget.exportFolder, '${safeName}_$timestamp.${widget.format}');
+        final mediaOptions = widget.exportMedia
+            ? MediaExportOptions(
+                exportImages: widget.exportImages,
+                exportVoices: widget.exportVoices,
+                exportEmojis: widget.exportEmojis,
+                exportDir: exportDir,
+                sessionUsername: targetSession.username,
+                configService: appState.configService,
+                voiceService: appState.voiceService,
+                dataPath: appState.databaseService.currentDataPath,
+                onProgress: (progress) {
+                  if (!mounted) return;
+                  if (progress.stage.isNotEmpty) {
+                    _mediaStageNotifier.value = progress.stage;
+                  }
+                  if (progress.exportedCount >= 0) {
+                    _exportedMediaNotifier.value = progress.exportedCount;
+                  }
+                },
+              )
+            : null;
 
         bool result = false;
         switch (widget.format) {
@@ -1562,6 +1713,7 @@ class _ExportProgressDialogState extends State<_ExportProgressDialog> {
               allMessages,
               filePath: savePath,
               onProgress: onExportProgress,
+              mediaOptions: mediaOptions,
             );
             break;
           case 'html':
@@ -1570,6 +1722,7 @@ class _ExportProgressDialogState extends State<_ExportProgressDialog> {
               allMessages,
               filePath: savePath,
               onProgress: onExportProgress,
+              mediaOptions: mediaOptions,
             );
             break;
           case 'xlsx':
@@ -1578,6 +1731,7 @@ class _ExportProgressDialogState extends State<_ExportProgressDialog> {
               allMessages,
               filePath: savePath,
               onProgress: onExportProgress,
+              mediaOptions: mediaOptions,
             );
             break;
           case 'sql':
@@ -1586,6 +1740,7 @@ class _ExportProgressDialogState extends State<_ExportProgressDialog> {
               allMessages,
               filePath: savePath,
               onProgress: onExportProgress,
+              mediaOptions: mediaOptions,
             );
             break;
         }
@@ -1802,45 +1957,103 @@ class _ExportProgressDialogState extends State<_ExportProgressDialog> {
             ),
           ],
         ],
+        ValueListenableBuilder<String>(
+          valueListenable: _mediaStageNotifier,
+          builder: (context, stage, _) {
+            if (stage.isEmpty) return const SizedBox.shrink();
+            return Padding(
+              padding: const EdgeInsets.only(top: 12),
+              child: Text(
+                stage,
+                style: TextStyle(
+                  fontSize: 12,
+                  color: Colors.grey.shade500,
+                  fontWeight: FontWeight.w500,
+                ),
+                textAlign: TextAlign.center,
+              ),
+            );
+          },
+        ),
         const SizedBox(height: 24),
         ValueListenableBuilder<int>(
           valueListenable: _exportedCountNotifier,
           builder: (context, count, _) {
-            return Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                _buildStatItem(
-                  '已处理会话',
-                  '${_successCount + _failedCount + 1} / $_totalSessions',
-                ),
-                Container(
-                  width: 1,
-                  height: 24,
-                  color: Colors.grey.shade200,
-                  margin: const EdgeInsets.symmetric(horizontal: 20),
-                ),
-                Column(
-                  children: [
-                    Text(
-                      '本会话消息',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: Colors.grey.shade400,
-                      ),
-                    ),
-                    const SizedBox(height: 4),
-                    _AnimatedCountText(
-                      count: count,
-                      style: const TextStyle(
-                        fontSize: 16,
-                        fontWeight: FontWeight.w800,
-                        color: Colors.black87,
-                      ),
-                      suffix: ' 条',
-                    ),
-                  ],
-                ),
-              ],
+            return ValueListenableBuilder<int>(
+              valueListenable: _exportedMediaNotifier,
+              builder: (context, mediaCount, __) {
+                return ValueListenableBuilder<String>(
+                  valueListenable: _mediaStageNotifier,
+                  builder: (context, stage, ___) {
+                    final showMedia = stage.isNotEmpty;
+                    return Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        _buildStatItem(
+                          '已处理会话',
+                          '${_successCount + _failedCount + 1} / $_totalSessions',
+                        ),
+                        Container(
+                          width: 1,
+                          height: 24,
+                          color: Colors.grey.shade200,
+                          margin: const EdgeInsets.symmetric(horizontal: 20),
+                        ),
+                        Column(
+                          children: [
+                            Text(
+                              '本会话消息',
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: Colors.grey.shade400,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            _AnimatedCountText(
+                              count: count,
+                              style: const TextStyle(
+                                fontSize: 16,
+                                fontWeight: FontWeight.w800,
+                                color: Colors.black87,
+                              ),
+                              suffix: ' 条',
+                            ),
+                          ],
+                        ),
+                        if (showMedia) ...[
+                          Container(
+                            width: 1,
+                            height: 24,
+                            color: Colors.grey.shade200,
+                            margin: const EdgeInsets.symmetric(horizontal: 20),
+                          ),
+                          Column(
+                            children: [
+                          Text(
+                            '已导出媒体(总计)',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.grey.shade400,
+                            ),
+                              ),
+                              const SizedBox(height: 4),
+                              _AnimatedCountText(
+                                count: mediaCount,
+                                style: const TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w800,
+                                  color: Colors.black87,
+                                ),
+                                suffix: ' 个',
+                              ),
+                            ],
+                          ),
+                        ],
+                      ],
+                    );
+                  },
+                );
+              },
             );
           },
         ),

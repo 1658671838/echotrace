@@ -63,6 +63,10 @@ class DatabaseService {
   List<String>? _cachedMessageDbPaths;
   DateTime? _messageDbCacheTime;
   static const Duration _messageDbCacheDuration = Duration(seconds: 60);
+  // 可用消息年份缓存（用于年度报告快速选择）
+  List<int>? _cachedMessageYears;
+  DateTime? _messageYearsCacheTime;
+  static const Duration _messageYearsCacheDuration = Duration(minutes: 5);
 
   // 媒体库（media_*.db）缓存
   final Map<String, Database> _cachedMediaDbs = {};
@@ -146,6 +150,8 @@ class DatabaseService {
       _contactDbPath = null;
       _cachedMessageDbPaths = null;
       _messageDbCacheTime = null;
+      _cachedMessageYears = null;
+      _messageYearsCacheTime = null;
       _currentAccountWxid =
           (_manualWxid != null && _manualWxid!.isNotEmpty)
               ? _manualWxid
@@ -228,6 +234,8 @@ class DatabaseService {
       _contactDbPath = null;
       _cachedMessageDbPaths = null;
       _messageDbCacheTime = null;
+      _cachedMessageYears = null;
+      _messageYearsCacheTime = null;
       _currentAccountWxid =
           (_manualWxid != null && _manualWxid!.isNotEmpty)
               ? _manualWxid
@@ -3226,6 +3234,8 @@ class DatabaseService {
     _stopRealtimeWatcher();
     _cachedMessageDbPaths = null;
     _messageDbCacheTime = null;
+    _cachedMessageYears = null;
+    _messageYearsCacheTime = null;
 
     // 如果有实时调用在运行，等待它们结束，避免关闭句柄时崩溃
     if (_mode == DatabaseMode.realtime && _activeWcdbOps > 0) {
@@ -4648,6 +4658,8 @@ class DatabaseService {
     _cacheLastUsed = null;
     _cachedMessageDbPaths = null;
     _messageDbCacheTime = null;
+    _cachedMessageYears = null;
+    _messageYearsCacheTime = null;
     _bulkQuerySourceCache.clear();
     _bulkQuerySourceCacheTime = null;
 
@@ -5652,6 +5664,65 @@ class DatabaseService {
       await logger.error('DatabaseService', '批量获取会话消息日期失败', e);
       rethrow;
     }
+  }
+
+  /// 获取当前数据库中有消息记录的年份列表
+  Future<List<int>> getAvailableMessageYears() async {
+    if (!isConnected) {
+      throw Exception('数据库未连接');
+    }
+
+    if (_cachedMessageYears != null &&
+        _messageYearsCacheTime != null &&
+        DateTime.now().difference(_messageYearsCacheTime!) <
+            _messageYearsCacheDuration) {
+      return List<int>.from(_cachedMessageYears!);
+    }
+
+    final years = <int>{};
+    try {
+      final cachedDbs = await _getCachedMessageDatabases();
+
+      for (final cachedDb in cachedDbs) {
+        try {
+          final tables = await cachedDb.database.rawQuery(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'",
+          );
+
+          for (final tableRow in tables) {
+            final tableName = tableRow['name'] as String;
+            try {
+              final rows = await cachedDb.database.rawQuery('''
+                SELECT DISTINCT CAST(
+                  strftime('%Y', datetime(create_time, 'unixepoch', 'localtime'))
+                  AS INTEGER
+                ) as year
+                FROM $tableName
+                WHERE create_time IS NOT NULL
+              ''');
+
+              for (final row in rows) {
+                final year = row['year'] as int?;
+                if (year != null && year > 1970) {
+                  years.add(year);
+                }
+              }
+            } catch (e) {
+              // 忽略单个表错误
+            }
+          }
+        } catch (e) {
+          // 忽略单个数据库错误
+        }
+      }
+    } catch (e) {
+      await logger.error('DatabaseService', '获取消息年份列表失败', e);
+    }
+
+    final sortedYears = years.toList()..sort();
+    _cachedMessageYears = sortedYears.toList();
+    _messageYearsCacheTime = DateTime.now();
+    return sortedYears;
   }
 
   /// 获取文本消息长度统计

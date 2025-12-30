@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:isolate';
 import 'dart:typed_data';
+import 'dart:convert';
 
 import 'package:flutter/services.dart';
 import 'package:flutter_lame/flutter_lame.dart';
@@ -162,11 +163,12 @@ class VoiceMessageService {
     final silkEnv = _buildProcessEnv(binaries.silkDecoder);
 
     // Silk -> PCM
-    final decodeResult = await Process.run(
+    final decodeResult = await _runProcessWithTimeout(
       binaries.silkDecoder,
       [silkPath, pcmPath, '-Fs_API', '$_sampleRate'],
       workingDirectory: p.dirname(binaries.silkDecoder),
       environment: silkEnv,
+      timeout: const Duration(seconds: 45),
     );
     if (decodeResult.exitCode != 0 || !File(pcmPath).existsSync()) {
       final stderrMsg = decodeResult.stderr?.toString() ?? '';
@@ -208,6 +210,43 @@ class VoiceMessageService {
         _decodeFinishedController.add(outputFile.path);
       }
     } catch (_) {}
+  }
+
+  Future<ProcessResult> _runProcessWithTimeout(
+    String executable,
+    List<String> arguments, {
+    String? workingDirectory,
+    Map<String, String>? environment,
+    Duration timeout = const Duration(seconds: 30),
+  }) async {
+    final process = await Process.start(
+      executable,
+      arguments,
+      workingDirectory: workingDirectory,
+      environment: environment,
+    );
+    final stdoutFuture = process.stdout.transform(utf8.decoder).join();
+    final stderrFuture = process.stderr.transform(utf8.decoder).join();
+    int exitCode;
+    try {
+      exitCode = await process.exitCode.timeout(timeout);
+    } on TimeoutException {
+      process.kill();
+      exitCode = -1;
+    }
+    String stdoutText = '';
+    String stderrText = '';
+    try {
+      stdoutText = await stdoutFuture.timeout(const Duration(seconds: 1));
+    } on TimeoutException {
+      stdoutText = '';
+    }
+    try {
+      stderrText = await stderrFuture.timeout(const Duration(seconds: 1));
+    } on TimeoutException {
+      stderrText = '';
+    }
+    return ProcessResult(process.pid, exitCode, stdoutText, stderrText);
   }
 
   Future<_BinaryPaths> _ensureBinariesReady() async {
