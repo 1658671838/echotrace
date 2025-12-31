@@ -1,0 +1,111 @@
+name: Build Windows & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Configure git/curl TLS backend
+        shell: pwsh
+        run: |
+          git config --global http.sslBackend openssl
+          git config --global http.version HTTP/1.1
+          git config --global http.postBuffer 524288000
+          "GIT_SSL_BACKEND=openssl" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "GIT_HTTP_VERSION=HTTP/1.1" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Cache pub
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\Pub\Cache
+          key: ${{ runner.os }}-pub-${{ hashFiles('**/pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pub-
+
+      - run: flutter clean
+      - run: flutter pub get
+
+      - name: Build Windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference="Stop"
+          for ($i=1; $i -le 5; $i++) {
+            try {
+              flutter build windows --release --verbose
+              break
+            } catch {
+              if ($i -eq 5) { throw }
+              Write-Host "Build failed, retrying... ($i/5)"
+              Start-Sleep -Seconds (30 * $i)
+            }
+          }
+
+      - name: Build zip
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $src = "build/windows/x64/runner/Release"
+          $zip = "echotrace-windows-$tag.zip"
+          if (!(Test-Path $src)) { dir build/windows -Recurse; throw "build output not found" }
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path "$src/*" -DestinationPath $zip -Force
+          "ZIP_NAME=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build release body
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { execSync } = require("child_process");
+            const fs = require("fs");
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const tag = context.ref.replace("refs/tags/", "");
+            const tags = execSync("git tag --sort=-creatordate").toString().trim().split("\n").filter(Boolean);
+            const idx = tags.indexOf(tag);
+            const prev = idx >= 0 && idx + 1 < tags.length ? tags[idx + 1] : null;
+            const gen = await github.request("POST /repos/{owner}/{repo}/releases/generate-notes", {
+              owner,
+              repo,
+              tag_name: tag,
+              previous_tag_name: prev || undefined
+            });
+            let body = gen.data.body || "";
+            if (prev) {
+              const cmp = await github.request("GET /repos/{owner}/{repo}/compare/{base}...{head}", {
+                owner,
+                repo,
+                base: prev,
+                head: tag
+              });
+              body += "\n\n---\n\n## Commits\n";
+              body += (cmp.data.commits || [])
+                .map(c => `- ${c.commit.message.split("\n")[0]} (${c.sha.slice(0,7)}) ${c.html_url}`)
+                .join("\n");
+            }
+            fs.writeFileSync("RELEASE_NOTES.md", body);
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_NOTES.md
+          files: |
+            ${{ env.ZIP_NAME }}
+            ${{ env.MSIX_NAME }}
