@@ -47,6 +47,7 @@ class _ChatExportPageState extends State<ChatExportPage>
   bool _exportImages = true;
   bool _exportVoices = true;
   bool _exportEmojis = true;
+  bool _exportAvatars = true;
   late final TextEditingController _searchController;
   late final FocusNode _searchFocusNode;
 
@@ -406,6 +407,7 @@ class _ChatExportPageState extends State<ChatExportPage>
     final mediaSummary = _exportMedia && mediaSelections.isNotEmpty
         ? '媒体导出: ${mediaSelections.join(' / ')}\n导出方式: 子文件夹 + 相对路径\n'
         : '';
+    final avatarSummary = "头像导出: ${_exportAvatars ? '开启' : '关闭'}\n";
 
     final confirmed = await showDialog<bool>(
       context: context,
@@ -416,6 +418,7 @@ class _ChatExportPageState extends State<ChatExportPage>
           '日期范围: $dateRangeText\n'
           '导出格式: ${_getFormatName(_selectedFormat)}\n'
           '$mediaSummary'
+          '$avatarSummary'
           '导出位置: $_exportFolder\n\n'
           '此操作可能需要一些时间，请耐心等待。',
         ),
@@ -451,6 +454,7 @@ class _ChatExportPageState extends State<ChatExportPage>
         exportImages: _exportImages,
         exportVoices: _exportVoices,
         exportEmojis: _exportEmojis,
+        exportAvatars: _exportAvatars,
       ),
     );
   }
@@ -1371,6 +1375,34 @@ class _ChatExportPageState extends State<ChatExportPage>
                       ),
                     ),
                   ),
+                  const SizedBox(height: 24),
+                  _buildSettingSection(
+                    title: '头像',
+                    subtitle: '可选导出头像索引（HTML/JSON/Excel），关闭则不下载头像',
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: Colors.grey.shade200),
+                      ),
+                      child: SwitchListTile(
+                        value: _exportAvatars,
+                        onChanged: (v) => setState(() => _exportAvatars = v),
+                        title: const Text(
+                          '导出头像',
+                          style: TextStyle(fontSize: 14),
+                        ),
+                        subtitle: const Text(
+                          '用于展示发送者头像，可能会读取或下载头像文件',
+                          style: TextStyle(fontSize: 11),
+                        ),
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                        ),
+                        activeColor: Theme.of(context).colorScheme.primary,
+                      ),
+                    ),
+                  ),
                   const SizedBox(height: 40),
                 ],
               ),
@@ -1491,6 +1523,7 @@ class _ExportProgressDialog extends StatefulWidget {
   final bool exportImages;
   final bool exportVoices;
   final bool exportEmojis;
+  final bool exportAvatars;
 
   const _ExportProgressDialog({
     required this.sessions,
@@ -1503,6 +1536,7 @@ class _ExportProgressDialog extends StatefulWidget {
     required this.exportImages,
     required this.exportVoices,
     required this.exportEmojis,
+    required this.exportAvatars,
   });
 
   @override
@@ -1519,6 +1553,7 @@ class _ExportProgressDialogState extends State<_ExportProgressDialog> {
   _ExportStatus _status = _ExportStatus.idle;
   String? _errorMessage;
   late int _totalSessions;
+  bool _isOpeningFolder = false;
 
   // 使用 ValueNotifier 来局部更新条数，避免重建整个 widget 导致进度条卡顿
   final ValueNotifier<int> _exportedCountNotifier = ValueNotifier<int>(0);
@@ -1713,6 +1748,7 @@ class _ExportProgressDialogState extends State<_ExportProgressDialog> {
               allMessages,
               filePath: savePath,
               onProgress: onExportProgress,
+              exportAvatars: widget.exportAvatars,
               mediaOptions: mediaOptions,
             );
             break;
@@ -1722,6 +1758,7 @@ class _ExportProgressDialogState extends State<_ExportProgressDialog> {
               allMessages,
               filePath: savePath,
               onProgress: onExportProgress,
+              exportAvatars: widget.exportAvatars,
               mediaOptions: mediaOptions,
             );
             break;
@@ -1731,6 +1768,7 @@ class _ExportProgressDialogState extends State<_ExportProgressDialog> {
               allMessages,
               filePath: savePath,
               onProgress: onExportProgress,
+              exportAvatars: widget.exportAvatars,
               mediaOptions: mediaOptions,
             );
             break;
@@ -1780,23 +1818,53 @@ class _ExportProgressDialogState extends State<_ExportProgressDialog> {
 
   // 辅助方法：打开文件夹
   Future<void> _openFolder() async {
+    if (_isOpeningFolder) return;
+    _isOpeningFolder = true;
     final path = widget.exportFolder;
     final uri = Uri.directory(path);
     try {
-      if (!await launchUrl(uri)) {
+      if (Platform.isWindows) {
+        unawaited(Process.start(
+          'explorer',
+          [path],
+          mode: ProcessStartMode.detached,
+        ));
+        return;
+      }
+      if (Platform.isMacOS) {
+        unawaited(Process.start(
+          'open',
+          [path],
+          mode: ProcessStartMode.detached,
+        ));
+        return;
+      }
+      if (Platform.isLinux) {
+        unawaited(Process.start(
+          'xdg-open',
+          [path],
+          mode: ProcessStartMode.detached,
+        ));
+        return;
+      }
+
+      final launched = await launchUrl(
+        uri,
+        mode: LaunchMode.externalApplication,
+      ).timeout(const Duration(seconds: 3));
+      if (!launched) {
         throw '无法打开文件夹';
       }
     } catch (e) {
-      // 平台特定的回退处理
+      // 回退处理：再尝试一次 URL 打开，避免进程启动失败导致无响应
       try {
-        if (Platform.isWindows) {
-          await Process.run('explorer', [path]);
-        } else if (Platform.isMacOS) {
-          await Process.run('open', [path]);
-        } else if (Platform.isLinux) {
-          await Process.run('xdg-open', [path]);
-        }
+        await launchUrl(
+          uri,
+          mode: LaunchMode.externalApplication,
+        ).timeout(const Duration(seconds: 3));
       } catch (_) {}
+    } finally {
+      _isOpeningFolder = false;
     }
   }
 

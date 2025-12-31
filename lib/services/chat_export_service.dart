@@ -1222,6 +1222,7 @@ class ChatExportService {
     List<Message> messages, {
     String? filePath,
     void Function(int current, int total, String stage)? onProgress,
+    bool exportAvatars = true,
     MediaExportOptions? mediaOptions,
   }) async {
     try {
@@ -1257,15 +1258,18 @@ class ChatExportService {
           : <String, String>{};
       final myDisplayName = await _buildMyDisplayName(rawMyWxid, myContactInfo);
 
-      onProgress?.call(0, totalMessages, '构建头像索引...');
-      final avatars = await _buildAvatarIndex(
-        session: session,
-        messages: messages,
-        contactInfo: contactInfo,
-        senderDisplayNames: senderDisplayNames,
-        rawMyWxid: rawMyWxid,
-        myDisplayName: myDisplayName,
-      );
+      var avatars = <String, Map<String, String>>{};
+      if (exportAvatars) {
+        onProgress?.call(0, totalMessages, '构建头像索引...');
+        avatars = await _buildAvatarIndex(
+          session: session,
+          messages: messages,
+          contactInfo: contactInfo,
+          senderDisplayNames: senderDisplayNames,
+          rawMyWxid: rawMyWxid,
+          myDisplayName: myDisplayName,
+        );
+      }
 
       onProgress?.call(0, totalMessages, '处理消息数据...');
       final mediaHelper = (mediaOptions != null && mediaOptions.enabled)
@@ -1324,9 +1328,11 @@ class ChatExportService {
             'isSend': msg.isSend,
             'senderUsername': senderWxid.isEmpty ? null : senderWxid,
             'senderDisplayName': senderName,
-            'senderAvatarKey': senderWxid.isEmpty ? null : senderWxid,
             'source': msg.source,
           };
+          if (exportAvatars && senderWxid.isNotEmpty) {
+            item['senderAvatarKey'] = senderWxid;
+          }
 
           if (msg.localType == 47 && msg.emojiMd5 != null) {
             item['emojiMd5'] = msg.emojiMd5;
@@ -1343,6 +1349,10 @@ class ChatExportService {
         await Future.delayed(Duration.zero);
       }
 
+      final groupMembers = session.isGroup
+          ? await _getGroupMemberExportData(session.username)
+          : null;
+
       final data = {
         'session': {
           'wxid': _sanitizeUsername(session.username),
@@ -1357,7 +1367,8 @@ class ChatExportService {
           'messageCount': messages.length,
         },
         'messages': messageItems,
-        'avatars': avatars,
+        if (exportAvatars) 'avatars': avatars,
+        if (groupMembers != null) 'groupMembers': groupMembers,
         'exportTime': DateTime.now().toIso8601String(),
       };
       if (mediaOptions != null && mediaOptions.enabled) {
@@ -1404,6 +1415,7 @@ class ChatExportService {
     List<Message> messages, {
     String? filePath,
     void Function(int current, int total, String stage)? onProgress,
+    bool exportAvatars = true,
     MediaExportOptions? mediaOptions,
   }) async {
     try {
@@ -1441,15 +1453,18 @@ class ChatExportService {
           : <String, String>{};
       final myDisplayName = await _buildMyDisplayName(rawMyWxid, myContactInfo);
 
-      onProgress?.call(0, totalMessages, '构建头像索引...');
-      final avatars = await _buildAvatarIndex(
-        session: session,
-        messages: messages,
-        contactInfo: contactInfo,
-        senderDisplayNames: senderDisplayNames,
-        rawMyWxid: rawMyWxid,
-        myDisplayName: myDisplayName,
-      );
+      var avatars = <String, Map<String, String>>{};
+      if (exportAvatars) {
+        onProgress?.call(0, totalMessages, '构建头像索引...');
+        avatars = await _buildAvatarIndex(
+          session: session,
+          messages: messages,
+          contactInfo: contactInfo,
+          senderDisplayNames: senderDisplayNames,
+          rawMyWxid: rawMyWxid,
+          myDisplayName: myDisplayName,
+        );
+      }
 
       final mediaHelper = (mediaOptions != null && mediaOptions.enabled)
           ? _MediaExportHelper(_databaseService, mediaOptions)
@@ -1486,6 +1501,7 @@ class ChatExportService {
           myWxid: myWxid,
           contactInfo: contactInfo,
           myDisplayName: myDisplayName,
+          exportAvatars: exportAvatars,
           mediaItem: mediaItem,
         );
         messagesData.add(item);
@@ -1536,6 +1552,7 @@ class ChatExportService {
     List<Message> messages, {
     String? filePath,
     void Function(int current, int total, String stage)? onProgress,
+    bool exportAvatars = true,
     MediaExportOptions? mediaOptions,
   }) async {
     final Workbook workbook = Workbook();
@@ -1618,14 +1635,16 @@ class ChatExportService {
         rawAccountWxid,
         currentAccountInfo,
       );
-      final avatars = await _buildAvatarIndex(
-        session: session,
-        messages: messages,
-        contactInfo: contactInfo,
-        senderDisplayNames: senderDisplayNames,
-        rawMyWxid: rawAccountWxid,
-        myDisplayName: myDisplayName,
-      );
+      final avatars = exportAvatars
+          ? await _buildAvatarIndex(
+              session: session,
+              messages: messages,
+              contactInfo: contactInfo,
+              senderDisplayNames: senderDisplayNames,
+              rawMyWxid: rawAccountWxid,
+              myDisplayName: myDisplayName,
+            )
+          : <String, Map<String, String>>{};
       final sanitizedAccountWxid = currentAccountWxid;
       if (sanitizedAccountWxid.isNotEmpty) {
         senderContactInfos[sanitizedAccountWxid] = currentAccountInfo;
@@ -1939,6 +1958,7 @@ class ChatExportService {
     int begintimestamp = 0,
     int endTimestamp = 0,
     int totalMessagesHint = 0,
+    bool exportAvatars = true,
     MediaExportOptions? mediaOptions,
   }) async {
     IOSink? sink;
@@ -2030,6 +2050,7 @@ class ChatExportService {
               rawMyWxid: rawMyWxid,
               myDisplayName: myDisplayName,
               myWxid: myWxid,
+              exportAvatars: exportAvatars,
               mediaItem: mediaItem,
             );
             final encoded = jsonEncode(item);
@@ -2048,18 +2069,29 @@ class ChatExportService {
         endTimestamp: endTimestamp,
       );
 
-      onProgress?.call(totalMessages, totalMessages, '构建头像索引...');
-      final avatars = await _buildAvatarIndexFromUsernames(
-        session: session,
-        senderUsernames: senderUsernames,
-        contactInfo: contactInfo,
-        senderDisplayNames: senderDisplayNames,
-        rawMyWxid: rawMyWxid,
-        myDisplayName: myDisplayName,
-      );
+      var avatars = <String, Map<String, String>>{};
+      if (exportAvatars) {
+        onProgress?.call(totalMessages, totalMessages, '构建头像索引...');
+        avatars = await _buildAvatarIndexFromUsernames(
+          session: session,
+          senderUsernames: senderUsernames,
+          contactInfo: contactInfo,
+          senderDisplayNames: senderDisplayNames,
+          rawMyWxid: rawMyWxid,
+          myDisplayName: myDisplayName,
+        );
+      }
+      final groupMembers = session.isGroup
+          ? await _getGroupMemberExportData(session.username)
+          : null;
 
       sink.write('\n  ],\n');
-      sink.writeln('  "avatars": ${jsonEncode(avatars)},');
+      if (exportAvatars) {
+        sink.writeln('  "avatars": ${jsonEncode(avatars)},');
+      }
+      if (groupMembers != null) {
+        sink.writeln('  "groupMembers": ${jsonEncode(groupMembers)},');
+      }
       if (mediaOptions != null && mediaOptions.enabled) {
         sink.writeln('  "mediaBase": "${mediaOptions.mediaDirName}",');
       }
@@ -2086,6 +2118,7 @@ class ChatExportService {
     int begintimestamp = 0,
     int endTimestamp = 0,
     int totalMessagesHint = 0,
+    bool exportAvatars = true,
     MediaExportOptions? mediaOptions,
   }) async {
     IOSink? sink;
@@ -2167,6 +2200,7 @@ class ChatExportService {
               myWxid: myWxid,
               contactInfo: contactInfo,
               myDisplayName: myDisplayName,
+              exportAvatars: exportAvatars,
               mediaItem: mediaItem,
             );
             final encoded = jsonEncode(item);
@@ -2185,15 +2219,18 @@ class ChatExportService {
         endTimestamp: endTimestamp,
       );
 
-      onProgress?.call(totalMessages, totalMessages, '构建头像索引...');
-      final avatars = await _buildAvatarIndexFromUsernames(
-        session: session,
-        senderUsernames: senderUsernames,
-        contactInfo: contactInfo,
-        senderDisplayNames: senderDisplayNames,
-        rawMyWxid: rawMyWxid,
-        myDisplayName: myDisplayName,
-      );
+      var avatars = <String, Map<String, String>>{};
+      if (exportAvatars) {
+        onProgress?.call(totalMessages, totalMessages, '构建头像索引...');
+        avatars = await _buildAvatarIndexFromUsernames(
+          session: session,
+          senderUsernames: senderUsernames,
+          contactInfo: contactInfo,
+          senderDisplayNames: senderDisplayNames,
+          rawMyWxid: rawMyWxid,
+          myDisplayName: myDisplayName,
+        );
+      }
 
       sink.write('\n  ];\n');
       sink.write(_buildHtmlFooterStream(avatars));
@@ -2218,6 +2255,7 @@ class ChatExportService {
     int begintimestamp = 0,
     int endTimestamp = 0,
     int totalMessagesHint = 0,
+    bool exportAvatars = true,
     MediaExportOptions? mediaOptions,
   }) async {
     final Workbook workbook = Workbook();
@@ -2359,14 +2397,16 @@ class ChatExportService {
       );
       onProgress?.call(index, totalMessages, '处理消息数据...');
 
-      final avatars = await _buildAvatarIndexFromUsernames(
-        session: session,
-        senderUsernames: senderUsernames,
-        contactInfo: contactInfo,
-        senderDisplayNames: senderDisplayNames,
-        rawMyWxid: rawAccountWxid,
-        myDisplayName: myDisplayName,
-      );
+      final avatars = exportAvatars
+          ? await _buildAvatarIndexFromUsernames(
+              session: session,
+              senderUsernames: senderUsernames,
+              contactInfo: contactInfo,
+              senderDisplayNames: senderDisplayNames,
+              rawMyWxid: rawAccountWxid,
+              myDisplayName: myDisplayName,
+            )
+          : <String, Map<String, String>>{};
 
       sheet.getRangeByIndex(1, 1).columnWidth = 8;
       sheet.getRangeByIndex(1, 2).columnWidth = 20;
@@ -2977,6 +3017,7 @@ class ChatExportService {
     required String rawMyWxid,
     required String myDisplayName,
     required String myWxid,
+    required bool exportAvatars,
     _MediaExportItem? mediaItem,
   }) {
     final isSend = msg.isSend == 1;
@@ -3007,9 +3048,11 @@ class ChatExportService {
       'isSend': msg.isSend,
       'senderUsername': senderWxid.isEmpty ? null : senderWxid,
       'senderDisplayName': senderName,
-      'senderAvatarKey': senderWxid.isEmpty ? null : senderWxid,
       'source': msg.source,
     };
+    if (exportAvatars && senderWxid.isNotEmpty) {
+      item['senderAvatarKey'] = senderWxid;
+    }
 
     if (msg.localType == 47 && msg.emojiMd5 != null) {
       item['emojiMd5'] = msg.emojiMd5;
@@ -3028,6 +3071,7 @@ class ChatExportService {
     required String myWxid,
     required Map<String, String> contactInfo,
     required String myDisplayName,
+    required bool exportAvatars,
     _MediaExportItem? mediaItem,
   }) {
     final msgDate = DateTime.fromMillisecondsSinceEpoch(
@@ -3066,7 +3110,7 @@ class ChatExportService {
       'content': _formatHtmlContent(msg, mediaItem),
       'senderName': senderName,
       'timestamp': msg.createTime,
-      'avatarKey': avatarKey.isEmpty ? null : avatarKey,
+      'avatarKey': exportAvatars && avatarKey.isNotEmpty ? avatarKey : null,
     };
   }
 
@@ -4394,8 +4438,7 @@ class ChatExportService {
 
   /// 获取联系人详细信息（nickname、remark）
   Future<Map<String, String>> _getContactInfo(String username) async {
-    final result = <String, String>{};
-
+    var result = <String, String>{};
     try {
       final contactDbPath = await _databaseService.getContactDatabasePath();
       if (contactDbPath == null) {
@@ -4410,57 +4453,12 @@ class ChatExportService {
       final contactDb = await databaseFactoryFfi.openDatabase(contactDbPath);
 
       try {
-        final candidates = <String>{
-          username.trim(),
-          _sanitizeUsername(username),
-        }..removeWhere((c) => c.isEmpty);
-
-        final tables = ['contact', 'stranger'];
-
-        for (final table in tables) {
-          for (final candidate in candidates) {
-            final maps = await contactDb.query(
-              table,
-              columns: ['nick_name', 'remark', 'alias'],
-              where: 'username = ?',
-              whereArgs: [candidate],
-              limit: 1,
-            );
-
-            if (maps.isNotEmpty) {
-              final map = maps.first;
-              final nickName = _normalizeDisplayField(
-                map['nick_name'] as String?,
-              );
-              final remark = _normalizeDisplayField(map['remark'] as String?);
-              final alias = _normalizeDisplayField(map['alias'] as String?);
-
-              if (_hasMeaningfulValue(remark)) {
-                result['remark'] = remark;
-              }
-
-              if (_hasMeaningfulValue(alias)) {
-                result['alias'] = alias;
-              }
-
-              if (_hasMeaningfulValue(nickName)) {
-                result['nickname'] = nickName;
-              }
-
-              if (result.isNotEmpty) {
-                return result;
-              }
-            }
-          }
-        }
-
-        if (result.isEmpty && _isCurrentAccount(username)) {
-          final selfInfo = await _getSelfInfoFromUserInfo(contactDb);
-          if (selfInfo.isNotEmpty) {
-            result.addAll(selfInfo);
-            return result;
-          }
-        }
+        result = await _getContactInfoFromDb(
+          contactDb,
+          username,
+          logMissing: false,
+        );
+        return result;
       } finally {
         await contactDb.close();
       }
@@ -4602,5 +4600,310 @@ class ChatExportService {
     return value
         .replaceAll(RegExp(r'^[ \t\r\n]+'), '')
         .replaceAll(RegExp(r'[ \t\r\n]+$'), '');
+  }
+
+  Future<List<Map<String, dynamic>>> _getGroupMemberExportData(
+    String chatroomId,
+  ) async {
+    final results = <Map<String, dynamic>>[];
+    try {
+      final contactDbPath = await _databaseService.getContactDatabasePath();
+      if (contactDbPath == null) {
+        return results;
+      }
+
+      final contactFile = File(contactDbPath);
+      if (!await contactFile.exists()) {
+        return results;
+      }
+
+      final contactDb = await databaseFactoryFfi.openDatabase(
+        contactDbPath,
+        options: OpenDatabaseOptions(readOnly: true, singleInstance: false),
+      );
+
+      try {
+        final memberRows =
+            await _loadChatroomMemberRows(contactDb, chatroomId);
+        if (memberRows.isEmpty) {
+          return results;
+        }
+
+        final seen = <String>{};
+        for (final row in memberRows) {
+          final username = _normalizeDisplayField(row['username'] as String?);
+          if (!_hasMeaningfulValue(username)) {
+            continue;
+          }
+          if (!seen.add(username)) {
+            continue;
+          }
+
+          final contactInfo = await _getContactInfoFromDb(
+            contactDb,
+            username,
+            logMissing: false,
+          );
+          final remark = _normalizeDisplayField(contactInfo['remark']);
+          final nickname = _normalizeDisplayField(contactInfo['nickname']);
+          final alias = _normalizeDisplayField(contactInfo['alias']);
+          final originalName = _hasMeaningfulValue(nickname)
+              ? nickname
+              : (_hasMeaningfulValue(alias) ? alias : username);
+
+          results.add({
+            'username': username,
+            'remark': _hasMeaningfulValue(remark) ? remark : null,
+            'originalName': originalName,
+          });
+        }
+      } finally {
+        await contactDb.close();
+      }
+    } catch (e) {}
+    return results;
+  }
+
+  Future<Map<String, String>> _getContactInfoFromDb(
+    Database contactDb,
+    String username, {
+    required bool logMissing,
+  }) async {
+    final result = <String, String>{};
+
+    final candidates = <String>{
+      username.trim(),
+      _sanitizeUsername(username),
+    }..removeWhere((c) => c.isEmpty);
+
+    final tables = ['contact', 'stranger'];
+
+    for (final table in tables) {
+      for (final candidate in candidates) {
+        final maps = await contactDb.query(
+          table,
+          columns: ['nick_name', 'remark', 'alias'],
+          where: 'username = ?',
+          whereArgs: [candidate],
+          limit: 1,
+        );
+
+        if (maps.isNotEmpty) {
+          final map = maps.first;
+          final nickName = _normalizeDisplayField(
+            map['nick_name'] as String?,
+          );
+          final remark = _normalizeDisplayField(map['remark'] as String?);
+          final alias = _normalizeDisplayField(map['alias'] as String?);
+
+          if (_hasMeaningfulValue(remark)) {
+            result['remark'] = remark;
+          }
+
+          if (_hasMeaningfulValue(alias)) {
+            result['alias'] = alias;
+          }
+
+          if (_hasMeaningfulValue(nickName)) {
+            result['nickname'] = nickName;
+          }
+
+          if (result.isNotEmpty) {
+            return result;
+          }
+        }
+      }
+    }
+
+    if (result.isEmpty && _isCurrentAccount(username)) {
+      final selfInfo = await _getSelfInfoFromUserInfo(contactDb);
+      if (selfInfo.isNotEmpty) {
+        result.addAll(selfInfo);
+        return result;
+      }
+    }
+
+    if (result.isEmpty && logMissing) {
+      final isSelf = _isCurrentAccount(username);
+      await _logMissingDisplayName(
+        username,
+        isSelf: isSelf,
+        details: isSelf
+            ? 'contact/stranger/userinfo 表无匹配记录'
+            : 'contact/stranger 表无匹配记录',
+      );
+    }
+
+    return result;
+  }
+
+  Future<List<Map<String, dynamic>>> _loadChatroomMemberRows(
+    Database contactDb,
+    String chatroomId,
+  ) async {
+    final tableRows = await contactDb.rawQuery(
+      "SELECT name FROM sqlite_master WHERE type='table'",
+    );
+    String? memberTable;
+    for (final row in tableRows) {
+      final name = row['name'] as String?;
+      if (name == null) continue;
+      final lower = name.toLowerCase();
+      if (lower == 'chatroom_member') {
+        memberTable = name;
+        break;
+      }
+    }
+    memberTable ??= tableRows
+        .map((row) => row['name'] as String?)
+        .firstWhere(
+          (name) {
+            final lower = name?.toLowerCase() ?? '';
+            return lower == 'chatroommembers' ||
+                lower == 'chatroom_members' ||
+                lower.contains('chatroommember');
+          },
+          orElse: () => null,
+        );
+
+    if (memberTable == null) {
+      return [];
+    }
+
+    final tableInfo = await contactDb.rawQuery(
+      "PRAGMA table_info('$memberTable')",
+    );
+    final columns = <String>[];
+    final columnTypes = <String, String>{};
+    for (final row in tableInfo) {
+      final name = row['name'] as String?;
+      if (name == null) continue;
+      columns.add(name);
+      final type = row['type'] as String?;
+      if (type != null) {
+        columnTypes[name] = type;
+      }
+    }
+
+    String? pickColumn(List<String> candidates) {
+      for (final candidate in candidates) {
+        final lowerCandidate = candidate.toLowerCase();
+        for (final column in columns) {
+          if (column.toLowerCase() == lowerCandidate) {
+            return column;
+          }
+        }
+      }
+      return null;
+    }
+
+    final usernameColumn = pickColumn(['username', 'user_name', 'usrname']);
+    final memberIdColumn = pickColumn(['member_id', 'memberid']);
+    final roomColumn = pickColumn([
+      'room_id',
+      'chatroomid',
+      'roomid',
+      'chatroom_id',
+    ]);
+    final displayColumn = pickColumn([
+      'display_name',
+      'displayname',
+      'nickname',
+      'nick_name',
+      'room_nickname',
+      'roomnick',
+      'room_nick_name',
+    ]);
+
+    if (roomColumn == null) {
+      return [];
+    }
+
+    if (usernameColumn == null && memberIdColumn == null) {
+      return [];
+    }
+
+    final roomIdRows = await contactDb.rawQuery(
+      'SELECT rowid FROM name2id WHERE username = ? LIMIT 1',
+      [chatroomId],
+    );
+    final roomId = roomIdRows.isNotEmpty
+        ? roomIdRows.first['rowid'] as int?
+        : null;
+
+    final roomType = columnTypes[roomColumn];
+    final roomIsText = _isTextColumnType(roomType);
+    final roomValues = <Object?>[];
+    if (roomIsText) {
+      roomValues.add(chatroomId);
+      if (roomId != null) {
+        roomValues.add(roomId);
+      }
+    } else {
+      if (roomId != null) {
+        roomValues.add(roomId);
+      }
+      roomValues.add(chatroomId);
+    }
+
+    final rows = <Map<String, dynamic>>[];
+    for (final roomValue in roomValues) {
+      if (roomValue == null) continue;
+      final query = _buildChatroomMemberQuery(
+        memberTable: memberTable,
+        usernameColumn: usernameColumn,
+        memberIdColumn: memberIdColumn,
+        roomColumn: roomColumn,
+        displayColumn: displayColumn,
+      );
+      final fetched = await contactDb.rawQuery(query, [roomValue]);
+      if (fetched.isNotEmpty) {
+        rows.addAll(fetched);
+        break;
+      }
+    }
+
+    return rows;
+  }
+
+  String _buildChatroomMemberQuery({
+    required String memberTable,
+    required String? usernameColumn,
+    required String? memberIdColumn,
+    required String roomColumn,
+    required String? displayColumn,
+  }) {
+    final buffer = StringBuffer('SELECT ');
+    if (usernameColumn != null) {
+      buffer.write('"$usernameColumn" AS username');
+    } else {
+      buffer.write('n.username AS username');
+    }
+
+    // 不再导出群昵称，仅保留原始名称与备注信息。
+
+    if (usernameColumn != null) {
+      buffer.write(' FROM "$memberTable"');
+    } else {
+      buffer.write(
+        ' FROM "$memberTable" m JOIN name2id n '
+        'ON m."$memberIdColumn" = n.rowid',
+      );
+    }
+
+    if (usernameColumn != null) {
+      buffer.write(' WHERE "$roomColumn" = ?');
+    } else {
+      buffer.write(' WHERE m."$roomColumn" = ?');
+    }
+
+    return buffer.toString();
+  }
+
+  bool _isTextColumnType(String? type) {
+    final lower = type?.toLowerCase() ?? '';
+    return lower.contains('char') ||
+        lower.contains('text') ||
+        lower.contains('clob');
   }
 }
