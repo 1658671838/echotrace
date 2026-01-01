@@ -125,19 +125,28 @@ class VoiceMessageService {
   ) async {
     final senderWxid = message.senderUsername;
     final myWxid = message.myWxid;
-    final lookupWxid = _voiceLookupWxidCandidate(message);
-    if (lookupWxid == null || lookupWxid.isEmpty) {
+    final candidates = _voiceLookupCandidates(message, sessionUsername);
+    if (candidates.isEmpty) {
       throw Exception('未找到语音关联 wxid，无法定位语音数据');
     }
 
-    final voiceBytes = await databaseService.fetchVoiceData(
-      senderWxid: lookupWxid,
-      createTime: message.createTime,
-    );
+    Uint8List? voiceBytes;
+    String? usedLookup;
+    for (final candidate in candidates) {
+      final data = await databaseService.fetchVoiceData(
+        senderWxid: candidate,
+        createTime: message.createTime,
+      );
+      if (data != null && data.isNotEmpty) {
+        voiceBytes = data;
+        usedLookup = candidate;
+        break;
+      }
+    }
     if (voiceBytes == null || voiceBytes.isEmpty) {
       throw Exception(
         '未在媒体数据库中找到语音原始数据（create_time=${message.createTime}, '
-        'lookup=$lookupWxid, sender=$senderWxid, my=$myWxid）',
+        'candidates=${candidates.join(",")}）',
       );
     }
 
@@ -146,11 +155,12 @@ class VoiceMessageService {
       'VoiceMessageService',
       'start decode: sender=$senderWxid create=${message.createTime} '
           'localId=${message.localId} bytes=${voiceBytes.length} '
-          'lookupWxid=$lookupWxid silk=${binaries.silkDecoder}',
+          'lookupWxid=$usedLookup silk=${binaries.silkDecoder}',
     );
 
     final tempDir = await AppPathService.getDocumentsDirectory();
-    final tempTag = lookupWxid.replaceAll(RegExp(r'[^a-zA-Z0-9_@.-]'), '_');
+    final tempTag = (usedLookup ?? candidates.first)
+        .replaceAll(RegExp(r'[^a-zA-Z0-9_@.-]'), '_');
     final silkPath = PathUtils.join(
       tempDir.path,
       'voice_${message.createTime}_$tempTag.silk',
@@ -466,20 +476,29 @@ class VoiceMessageService {
   }
 
   Future<int?> _calcDuration(Message message) async {
-    final lookupWxid = _voiceLookupWxidCandidate(message);
-    if (lookupWxid == null || lookupWxid.isEmpty) return null;
+    final candidates = _voiceLookupCandidates(message, '');
+    if (candidates.isEmpty) return null;
 
-    final voiceBytes = await databaseService.fetchVoiceData(
-      senderWxid: lookupWxid,
-      createTime: message.createTime,
-    );
+    Uint8List? voiceBytes;
+    String? usedLookup;
+    for (final candidate in candidates) {
+      final data = await databaseService.fetchVoiceData(
+        senderWxid: candidate,
+        createTime: message.createTime,
+      );
+      if (data != null && data.isNotEmpty) {
+        voiceBytes = data;
+        usedLookup = candidate;
+        break;
+      }
+    }
     if (voiceBytes == null || voiceBytes.isEmpty) return null;
 
     final binaries = await _ensureBinariesReady();
     final tempDir = await AppPathService.getDocumentsDirectory();
     final silkPath = PathUtils.join(
       tempDir.path,
-      'voice_${message.createTime}_${lookupWxid}_dur.silk',
+      'voice_${message.createTime}_${usedLookup ?? candidates.first}_dur.silk',
     );
     final pcmPath = PathUtils.replaceExtension(silkPath, '.pcm');
 
@@ -512,14 +531,22 @@ class VoiceMessageService {
     return durationSeconds;
   }
 
-  String? _voiceLookupWxidCandidate(Message message) {
-    final senderWxid = message.senderUsername;
-    final myWxid = message.myWxid;
-    final isFromMe = (message.isSend ?? 0) == 1;
+  List<String> _voiceLookupCandidates(
+    Message message,
+    String sessionUsername,
+  ) {
+    final candidates = <String>[];
+    void add(String? value) {
+      final trimmed = value?.trim();
+      if (trimmed == null || trimmed.isEmpty) return;
+      if (!candidates.contains(trimmed)) candidates.add(trimmed);
+    }
 
-    final v =
-        (isFromMe ? myWxid : senderWxid) ?? (isFromMe ? senderWxid : myWxid);
-    return v?.trim();
+    // 群聊优先尝试会话 ID（@chatroom），私聊不影响。
+    add(sessionUsername);
+    add(message.senderUsername);
+    add(message.myWxid);
+    return candidates;
   }
 }
 
