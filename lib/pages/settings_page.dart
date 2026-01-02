@@ -1,5 +1,3 @@
-// ignore_for_file: unused_field
-
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:provider/provider.dart';
@@ -41,9 +39,6 @@ class _SettingsPageState extends State<SettingsPage>
   final _wxidScanService = WxidScanService();
   late final ToastOverlay _toast;
 
-  final bool _obscureKey = true;
-  final bool _obscureImageXorKey = true;
-  final bool _obscureImageAesKey = true;
   bool _isLoading = false;
   String? _statusMessage;
   bool _isSuccess = false;
@@ -834,7 +829,7 @@ class _SettingsPageState extends State<SettingsPage>
               subtitle: '请输入64位十六进制密钥',
               child: TextFormField(
                 controller: _keyController,
-                obscureText: _obscureKey,
+                obscureText: true,
                 decoration: InputDecoration(
                   hintText: '例如: a1b2c3d4e5f6...',
                   border: OutlineInputBorder(
@@ -1199,7 +1194,7 @@ class _SettingsPageState extends State<SettingsPage>
               subtitle: '2位十六进制密钥（支持0x前缀），例如：0x53 或 53',
               child: TextFormField(
                 controller: _imageXorKeyController,
-                obscureText: _obscureImageXorKey,
+                obscureText: true,
                 decoration: InputDecoration(
                   hintText: '例如: 0x12 或 A3',
                   border: OutlineInputBorder(
@@ -1251,7 +1246,7 @@ class _SettingsPageState extends State<SettingsPage>
               subtitle: '至少16个字符的字母数字字符串，从微信进程内存获取',
               child: TextFormField(
                 controller: _imageAesKeyController,
-                obscureText: _obscureImageAesKey,
+                obscureText: true,
                 decoration: InputDecoration(
                   hintText: '例如: b123456789012345...',
                   border: OutlineInputBorder(

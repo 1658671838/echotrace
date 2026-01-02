@@ -64,6 +64,20 @@ class DualReportHtmlRenderer {
       ),
     );
 
+    // 第四部分：常用语（词云）
+    final wordCloudData = reportData['wordCloud'] as Map<String, dynamic>?;
+    buffer.writeln(
+      _buildSection(
+        'word-cloud',
+        _buildWordCloudBody(
+          wordCloudData,
+          myName,
+          friendName,
+          reportData['year'] as int?,
+        ),
+      ),
+    );
+
     buffer.writeln('</main>');
 
     // JavaScript
@@ -360,6 +374,56 @@ section.page.visible .content-wrapper {
   * { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; scroll-behavior: auto !important; }
   .main-container { scroll-snap-type: none; }
 }
+
+.word-cloud-container {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  justify-content: center;
+  align-items: center;
+  padding: 30px 20px;
+  background: #FFFFFF;
+  border-radius: 20px;
+  margin: 24px 0;
+  border: 1px solid var(--line-color);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.05);
+}
+
+.word-tag {
+  display: inline-block;
+  padding: 8px 16px;
+  background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+  border-radius: 20px;
+  white-space: nowrap;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+  cursor: default;
+}
+
+.word-tag:hover {
+  transform: scale(1.05);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+}
+
+.top-phrases {
+  margin-top: 20px;
+  padding: 20px;
+  background: linear-gradient(135deg, rgba(7, 193, 96, 0.08) 0%, rgba(242, 170, 0, 0.05) 100%);
+  border-radius: 16px;
+}
+
+.top-phrases-title {
+  font-size: 14px;
+  color: #888;
+  margin-bottom: 12px;
+  letter-spacing: 1px;
+}
+
+.top-phrases-list {
+  font-size: 18px;
+  color: var(--primary);
+  font-weight: 600;
+  line-height: 1.8;
+}
 ''';
   }
 
@@ -548,6 +612,85 @@ $thisYearSection
         .replaceAll('>', '&gt;')
         .replaceAll('"', '&quot;')
         .replaceAll("'", '&#39;');
+  }
+
+  /// 构建词云部分
+  static String _buildWordCloudBody(
+    Map<String, dynamic>? wordCloudData,
+    String myName,
+    String friendName,
+    int? year,
+  ) {
+    final yearText = year != null ? '${year}年' : '历史以来';
+
+    if (wordCloudData == null) {
+      return '''
+<div class="label-text">常用语</div>
+<div class="hero-title">暂无数据</div>
+<div class="hero-desc">需要足够的文本消息才能生成</div>
+''';
+    }
+
+    final words = (wordCloudData['words'] as List?) ?? [];
+
+    if (words.isEmpty) {
+      return '''
+<div class="label-text">常用语</div>
+<div class="hero-title">暂无数据</div>
+<div class="hero-desc">需要足够的文本消息才能生成</div>
+''';
+    }
+
+    // 获取最大频率用于计算字体大小
+    final maxCount = words.isNotEmpty
+        ? ((words.first as Map)['count'] as int? ?? 1)
+        : 1;
+
+    // 构建词云标签（显示前15个）
+    final wordItems = words
+        .take(15)
+        .map((item) {
+          final sentence = _escapeHtml((item as Map)['word']?.toString() ?? '');
+          final count = (item['count'] as int?) ?? 1;
+
+          // 根据频率计算字体大小 (14px - 28px)
+          final ratio = count / maxCount;
+          final fontSize = (14 + ratio * 14).round();
+
+          // 根据频率选择颜色
+          String color;
+          if (ratio > 0.65) {
+            color = '#07C160';
+          } else if (ratio > 0.4) {
+            color = '#F2AA00';
+          } else if (ratio > 0.2) {
+            color = '#2F3437';
+          } else {
+            color = '#6B6F73';
+          }
+
+          return '''
+<span class="word-tag" style="font-size: ${fontSize}px; color: $color;" title="出现 $count 次">$sentence</span>''';
+        })
+        .join('');
+
+    // 获取前3个高频句子
+    final topThree = words
+        .take(3)
+        .map((item) => _escapeHtml((item as Map)['word']?.toString() ?? ''))
+        .join('、');
+
+    return '''
+<div class="label-text">常用语</div>
+<div class="hero-title">你们的专属口头禅</div>
+<div class="hero-desc">$yearText，你们说得最多的是：</div>
+<div class="word-cloud-container">$wordItems</div>
+<div class="top-phrases">
+  <div class="top-phrases-title">TOP 3 高频句子</div>
+  <div class="top-phrases-list">$topThree</div>
+</div>
+<div class="hero-desc" style="margin-top: 20px; font-size: 14px; color: #999;">句子越大、颜色越深，出现频率越高</div>
+''';
   }
 
   /// 构建section

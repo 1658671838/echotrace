@@ -3241,7 +3241,6 @@ class _SmoothLinearProgress extends StatefulWidget {
     required this.backgroundColor,
     required this.valueColor,
     this.duration = const Duration(milliseconds: 420),
-    // ignore: unused_element_parameter
     this.curve = Curves.easeOutCubic,
   });
 

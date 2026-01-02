@@ -630,7 +630,7 @@ section.page.visible .content-wrapper {
   static String _buildIntroBody(NumberFormat fmt, int friends, int messages) {
     return '''
 <div class="label-text">年度概览</div>
-<div class="hero-title">你的你的朋友们<br>互相发过</div>
+<div class="hero-title">你和你的朋友们<br>互相发过</div>
 <div class="big-stat">
   <div class="stat-num">${fmt.format(messages)}</div>
   <div class="stat-unit">条消息</div>
@@ -829,7 +829,7 @@ $heatmap
   static String _buildWordCloudBody(List words) {
     if (words.isEmpty) {
       return '''
-<div class="label-text">年度词云</div>
+<div class="label-text">年度常用语</div>
 <div class="hero-title">暂无数据</div>
 <div class="hero-desc">需要足够的文本消息才能生成</div>
 ''';
@@ -880,7 +880,7 @@ $heatmap
         .join('、');
 
     return '''
-<div class="label-text">年度词云</div>
+<div class="label-text">年度常用语</div>
 <div class="hero-title">你的年度常用语</div>
 <div class="hero-desc" style="margin-bottom: 30px;">这一年，你说得最多的是：<br><span class="hl" style="font-size: 20px;">$topThree</span></div>
 <div class="word-cloud-container">$wordItems</div>
@@ -1038,7 +1038,7 @@ $heatmap
     'activity': '作息规律',
     'midnight': '深夜好友',
     'response': '回应速度',
-    'wordcloud': '年度词云',
+    'wordcloud': '年度常用语',
     'former': '曾经的好朋友',
     'ending': '尾声'
   };

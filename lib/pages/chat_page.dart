@@ -1975,8 +1975,7 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
             );
 
             await Future.any([
-              // ignore: body_might_complete_normally_catch_error
-              decodeFuture.catchError((_) {}),
+              decodeFuture.catchError((_) => null),
               waitReady,
             ]).timeout(const Duration(seconds: 60));
 

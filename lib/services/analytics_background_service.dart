@@ -47,7 +47,6 @@ class _AnalyticsTask {
   final List<String> excludedUsernames;
   final SendPort sendPort;
   final RootIsolateToken rootIsolateToken;
-  final String? myWxid; // 当前用户的 wxid（用于词云等只统计自己消息的场景）
 
   _AnalyticsTask({
     required this.dbPath,
@@ -57,7 +56,6 @@ class _AnalyticsTask {
     required this.excludedUsernames,
     required this.sendPort,
     required this.rootIsolateToken,
-    this.myWxid,
   });
 }
 
@@ -86,10 +84,9 @@ typedef AnalyticsProgressCallback =
 /// 所有分析任务都在后台运行，只返回最终结果
 class AnalyticsBackgroundService {
   final String dbPath;
-  final String? myWxid; // 当前用户的 wxid
   Set<String> _excludedUsernames = {};
 
-  AnalyticsBackgroundService(this.dbPath, {this.myWxid, Set<String>? excludedUsernames}) {
+  AnalyticsBackgroundService(this.dbPath, {Set<String>? excludedUsernames}) {
     if (excludedUsernames != null) {
       _excludedUsernames =
           excludedUsernames.map((name) => name.toLowerCase()).toSet();
@@ -259,7 +256,6 @@ class AnalyticsBackgroundService {
         excludedUsernames: _excludedUsernames.toList(),
         sendPort: receivePort.sendPort,
         rootIsolateToken: ServicesBinding.rootIsolateToken!,
-        myWxid: myWxid,
       );
 
       await logger.debug('RunAnalysis', '准备启动Isolate: $analysisType');
@@ -1000,193 +996,6 @@ class AnalyticsBackgroundService {
               };
               break;
 
-            case 'word_cloud':
-              final yearText = task.filterYear != null ? '${task.filterYear}年' : '全部';
-              sendLog('开始生成词云数据（年份：$yearText）', level: 'info');
-              task.sendPort.send(
-                _AnalyticsMessage(
-                  type: 'progress',
-                  stage: '正在分析文本消息...',
-                  current: 30,
-                  total: 100,
-                  elapsedSeconds: DateTime.now()
-                      .difference(startTime)
-                      .inSeconds,
-                  estimatedRemainingSeconds: _estimateRemainingTime(
-                    30,
-                    100,
-                    startTime,
-                  ),
-                ),
-              );
-
-              // 获取文本消息（只获取当前用户发送的消息，不限制数量）
-              // 如果指定了年份，必须获取该年份的所有消息
-              sendLog('开始查询${yearText}的所有聊天记录...', level: 'info');
-              var lastProgress = 30;
-              final messages = await dbService.getTextMessagesForWordCloud(
-                year: task.filterYear,
-                excludedUsernames: task.excludedUsernames.toSet(),
-                onlyMySent: true,
-                myWxid: task.myWxid,
-                onLog: (message, {String level = 'info'}) {
-                  sendLog(message, level: level);
-                },
-                onProgress: (current, total, stage) {
-                  if (total <= 0) return;
-                  final progress = 30 + ((current / total) * 15).floor();
-                  if (progress == lastProgress) return;
-                  lastProgress = progress;
-                  task.sendPort.send(
-                    _AnalyticsMessage(
-                      type: 'progress',
-                      stage: stage,
-                      current: progress,
-                      total: 100,
-                      elapsedSeconds: DateTime.now()
-                          .difference(startTime)
-                          .inSeconds,
-                      estimatedRemainingSeconds: _estimateRemainingTime(
-                        progress,
-                        100,
-                        startTime,
-                      ),
-                    ),
-                  );
-                },
-              );
-              sendLog('${yearText}共获取到 ${messages.length} 条我发送的文本消息', level: 'info');
-
-              task.sendPort.send(
-                _AnalyticsMessage(
-                  type: 'progress',
-                  stage: '正在统计句子频率...',
-                  current: 50,
-                  total: 100,
-                  elapsedSeconds: DateTime.now()
-                      .difference(startTime)
-                      .inSeconds,
-                  estimatedRemainingSeconds: _estimateRemainingTime(
-                    50,
-                    100,
-                    startTime,
-                  ),
-                ),
-              );
-
-              // 统计完整句子的出现频率
-              final sentenceCount = <String, int>{};
-              
-              // 清理和规范化句子
-              String normalizeSentence(String text) {
-                // 去除首尾空白
-                text = text.trim();
-                // 将多个连续空白/换行符替换为单个空格
-                text = text.replaceAll(RegExp(r'\s+'), ' ');
-                // 去除常见的消息标记
-                text = text.replaceAll(RegExp(r'^\[.*?\]'), ''); // 去除 [xxx] 开头
-                text = text.trim();
-                return text;
-              }
-              
-              // 判断句子是否有效（放宽条件，确保更多句子被统计）
-              bool isValidSentence(String sentence) {
-                if (sentence.isEmpty) return false;
-                // 长度限制：至少2个字符，最多500个字符（放宽上限）
-                if (sentence.length < 2 || sentence.length > 500) return false;
-                
-                // 跳过包含 wxid 的句子（通常是引用消息）
-                if (sentence.contains('wxid_') || 
-                    sentence.contains('wxid:') ||
-                    sentence.toLowerCase().contains('wxid')) {
-                  return false;
-                }
-                
-                // 跳过纯数字（但允许包含数字的句子）
-                if (RegExp(r'^\d+$').hasMatch(sentence)) return false;
-                
-                // 放宽条件：中文字符、英文字母、数字的总数应该至少占20%（从30%降低）
-                final chineseChars = RegExp(r'[\u4e00-\u9fa5]').allMatches(sentence).length;
-                final englishChars = RegExp(r'[a-zA-Z]').allMatches(sentence).length;
-                final digits = RegExp(r'\d').allMatches(sentence).length;
-                final meaningfulChars = chineseChars + englishChars + digits;
-                // 如果句子很短（<=5个字符），只要有1个有意义字符即可
-                if (sentence.length <= 5) {
-                  if (meaningfulChars == 0) return false;
-                } else {
-                  // 长句子要求至少20%是有意义字符
-                  if (meaningfulChars / sentence.length < 0.2) return false;
-                }
-                
-                // 跳过只有单个字符重复的句子（如 "哈哈哈"、"..."），但允许2-3个字符的重复
-                if (sentence.length > 5) {
-                  final firstChar = sentence[0];
-                  if (sentence.split('').every((c) => c == firstChar)) {
-                    return false;
-                  }
-                }
-                
-                // 只跳过最常见的无意义单字符回复
-                final meaninglessSingleChars = {
-                  '嗯', '哦', '啊', '额', '呃',
-                };
-                if (sentence.length == 1 && meaninglessSingleChars.contains(sentence)) {
-                  return false;
-                }
-                
-                return true;
-              }
-
-              for (final content in messages) {
-                if (content.isEmpty) continue;
-                
-                // 规范化句子
-                final normalized = normalizeSentence(content);
-                
-                // 检查句子是否有效
-                if (!isValidSentence(normalized)) continue;
-                
-                // 统计句子频率
-                sentenceCount[normalized] = (sentenceCount[normalized] ?? 0) + 1;
-              }
-
-              task.sendPort.send(
-                _AnalyticsMessage(
-                  type: 'progress',
-                  stage: '正在整理句子数据...',
-                  current: 80,
-                  total: 100,
-                  elapsedSeconds: DateTime.now()
-                      .difference(startTime)
-                      .inSeconds,
-                  estimatedRemainingSeconds: _estimateRemainingTime(
-                    80,
-                    100,
-                    startTime,
-                  ),
-                ),
-              );
-
-              // 过滤并排序，取前100个高频句子
-              final sortedSentences = sentenceCount.entries.toList()
-                ..sort((a, b) => b.value.compareTo(a.value));
-              
-              sendLog('句子统计：共找到 ${sentenceCount.length} 个不同的句子，总出现次数 ${sortedSentences.fold(0, (sum, e) => sum + e.value)}', level: 'info');
-              
-              final topSentences = sortedSentences
-                  .where((e) => e.value >= 1) // 至少出现1次（显示所有句子）
-                  .take(100)
-                  .map((e) => {'word': e.key, 'count': e.value})
-                  .toList();
-
-              sendLog('句子统计完成，共 ${topSentences.length} 个高频句子（前100个）', level: 'info');
-              result = {
-                'words': topSentences,
-                'totalWords': sentenceCount.length,
-                'totalMessages': messages.length,
-              };
-              break;
-
             default:
               sendLog('未知的分析类型: ${task.analysisType}', level: 'error');
               throw Exception('未知的分析类型: ${task.analysisType}');
@@ -1439,19 +1248,6 @@ class AnalyticsBackgroundService {
     };
   }
 
-  /// 词云分析（后台版本）
-  Future<Map<String, dynamic>> analyzeWordCloudInBackground(
-    int? filterYear,
-    AnalyticsProgressCallback progressCallback,
-  ) async {
-    final result = await _runAnalysisInIsolate(
-      analysisType: 'word_cloud',
-      filterYear: filterYear,
-      progressCallback: progressCallback,
-    );
-    return result as Map<String, dynamic>;
-  }
-
   /// 生成完整年度报告（并行执行所有任务）
   Future<Map<String, dynamic>> generateFullAnnualReport(
     int? filterYear,
@@ -1483,7 +1279,6 @@ class AnalyticsBackgroundService {
       '深夜密友',
       '最快响应好友',
       '我回复最快',
-      '年度词云',
       if (includeFormerFriends) '曾经的好朋友',
     ];
 
@@ -1523,7 +1318,7 @@ class AnalyticsBackgroundService {
     final timeout = const Duration(minutes: 5);
     await logger.debug('AnnualReport', '任务超时设置: ${timeout.inMinutes} 分钟');
 
-    await logger.info('AnnualReport', '开始任务 1/14: 绝对核心好友');
+    await logger.info('AnnualReport', '开始任务 1/13: 绝对核心好友');
     final coreFriendsData =
         await getAbsoluteCoreFriendsInBackground(
           filterYear,
@@ -1535,9 +1330,9 @@ class AnalyticsBackgroundService {
             throw TimeoutException('分析绝对核心好友超时，数据量可能过大');
           },
         );
-    await logger.info('AnnualReport', '完成任务 1/14: 绝对核心好友');
+    await logger.info('AnnualReport', '完成任务 1/13: 绝对核心好友');
 
-    await logger.info('AnnualReport', '开始任务 2/14: 年度倾诉对象');
+    await logger.info('AnnualReport', '开始任务 2/13: 年度倾诉对象');
     final confidant =
         await getConfidantObjectsInBackground(
           filterYear,
@@ -1549,9 +1344,9 @@ class AnalyticsBackgroundService {
             throw TimeoutException('分析年度倾诉对象超时');
           },
         );
-    await logger.info('AnnualReport', '完成任务 2/14: 年度倾诉对象');
+    await logger.info('AnnualReport', '完成任务 2/13: 年度倾诉对象');
 
-    await logger.info('AnnualReport', '开始任务 3/14: 年度最佳听众');
+    await logger.info('AnnualReport', '开始任务 3/13: 年度最佳听众');
     final listeners =
         await getBestListenersInBackground(
           filterYear,
@@ -1563,9 +1358,9 @@ class AnalyticsBackgroundService {
             throw TimeoutException('分析年度最佳听众超时');
           },
         );
-    await logger.info('AnnualReport', '完成任务 3/14: 年度最佳听众');
+    await logger.info('AnnualReport', '完成任务 3/13: 年度最佳听众');
 
-    await logger.info('AnnualReport', '开始任务 4/14: 月度好友');
+    await logger.info('AnnualReport', '开始任务 4/13: 月度好友');
     final monthlyTopFriendsData =
         await getMonthlyTopFriendsInBackground(
           filterYear,
@@ -1577,9 +1372,9 @@ class AnalyticsBackgroundService {
             throw TimeoutException('分析月度好友超时');
           },
         );
-    await logger.info('AnnualReport', '完成任务 4/14: 月度好友');
+    await logger.info('AnnualReport', '完成任务 4/13: 月度好友');
 
-    await logger.info('AnnualReport', '开始任务 5/14: 双向奔赴好友');
+    await logger.info('AnnualReport', '开始任务 5/13: 双向奔赴好友');
     final mutualFriends =
         await getMutualFriendsRankingInBackground(
           filterYear,
@@ -1591,9 +1386,9 @@ class AnalyticsBackgroundService {
             throw TimeoutException('分析双向奔赴好友超时');
           },
         );
-    await logger.info('AnnualReport', '完成任务 5/14: 双向奔赴好友');
+    await logger.info('AnnualReport', '完成任务 5/13: 双向奔赴好友');
 
-    await logger.info('AnnualReport', '开始任务 6/14: 主动社交指数');
+    await logger.info('AnnualReport', '开始任务 6/13: 主动社交指数');
     final socialInitiative =
         await analyzeSocialInitiativeRateInBackground(
           filterYear,
@@ -1605,9 +1400,9 @@ class AnalyticsBackgroundService {
             throw TimeoutException('分析主动社交指数超时');
           },
         );
-    await logger.info('AnnualReport', '完成任务 6/14: 主动社交指数');
+    await logger.info('AnnualReport', '完成任务 6/13: 主动社交指数');
 
-    await logger.info('AnnualReport', '开始任务 7/14: 聊天巅峰日');
+    await logger.info('AnnualReport', '开始任务 7/13: 聊天巅峰日');
     final peakDay =
         await analyzePeakChatDayInBackground(
           filterYear,
@@ -1619,9 +1414,9 @@ class AnalyticsBackgroundService {
             throw TimeoutException('分析聊天巅峰日超时');
           },
         );
-    await logger.info('AnnualReport', '完成任务 7/14: 聊天巅峰日');
+    await logger.info('AnnualReport', '完成任务 7/13: 聊天巅峰日');
 
-    await logger.info('AnnualReport', '开始任务 8/14: 连续打卡记录');
+    await logger.info('AnnualReport', '开始任务 8/13: 连续打卡记录');
     final checkIn =
         await findLongestCheckInRecordInBackground(
           filterYear,
@@ -1633,9 +1428,9 @@ class AnalyticsBackgroundService {
             throw TimeoutException('分析连续打卡记录超时');
           },
         );
-    await logger.info('AnnualReport', '完成任务 8/14: 连续打卡记录');
+    await logger.info('AnnualReport', '完成任务 8/13: 连续打卡记录');
 
-    await logger.info('AnnualReport', '开始任务 9/14: 作息图谱');
+    await logger.info('AnnualReport', '开始任务 9/13: 作息图谱');
     final activityPattern =
         await analyzeActivityPatternInBackground(
           filterYear,
@@ -1647,9 +1442,9 @@ class AnalyticsBackgroundService {
             throw TimeoutException('分析作息图谱超时');
           },
         );
-    await logger.info('AnnualReport', '完成任务 9/14: 作息图谱');
+    await logger.info('AnnualReport', '完成任务 9/13: 作息图谱');
 
-    await logger.info('AnnualReport', '开始任务 10/14: 深夜密友');
+    await logger.info('AnnualReport', '开始任务 10/13: 深夜密友');
     final midnightKing =
         await findMidnightChatKingInBackground(
           filterYear,
@@ -1661,9 +1456,9 @@ class AnalyticsBackgroundService {
             throw TimeoutException('分析深夜密友超时');
           },
         );
-    await logger.info('AnnualReport', '完成任务 10/14: 深夜密友');
+    await logger.info('AnnualReport', '完成任务 10/13: 深夜密友');
 
-    await logger.info('AnnualReport', '开始任务 11/14: 最快响应好友');
+    await logger.info('AnnualReport', '开始任务 11/13: 最快响应好友');
     final whoRepliesFastest =
         await analyzeWhoRepliesFastestInBackground(
           filterYear,
@@ -1675,9 +1470,9 @@ class AnalyticsBackgroundService {
             throw TimeoutException('分析最快响应好友超时，可能因为好友数量过多');
           },
         );
-    await logger.info('AnnualReport', '完成任务 11/14: 最快响应好友');
+    await logger.info('AnnualReport', '完成任务 11/13: 最快响应好友');
 
-    await logger.info('AnnualReport', '开始任务 12/14: 我回复最快');
+    await logger.info('AnnualReport', '开始任务 12/13: 我回复最快');
     final myFastestReplies =
         await analyzeMyFastestRepliesInBackground(
           filterYear,
@@ -1689,31 +1484,13 @@ class AnalyticsBackgroundService {
             throw TimeoutException('分析我回复最快超时，可能因为好友数量过多');
           },
         );
-    await logger.info('AnnualReport', '完成任务 12/14: 我回复最快');
-
-    await logger.info('AnnualReport', '开始任务 13/14: 年度词云');
-    Map<String, dynamic> wordCloudData = {'words': [], 'totalWords': 0, 'totalMessages': 0};
-    try {
-      wordCloudData = await analyzeWordCloudInBackground(
-        filterYear,
-        createProgressCallback('年度词云'),
-      ).timeout(
-        timeout,
-        onTimeout: () {
-          logger.error('AnnualReport', '任务超时: 年度词云');
-          throw TimeoutException('分析年度词云超时');
-        },
-      );
-    } catch (e) {
-      await logger.warning('AnnualReport', '词云分析失败，使用空数据: $e');
-    }
-    await logger.info('AnnualReport', '完成任务 13/14: 年度词云');
+    await logger.info('AnnualReport', '完成任务 12/13: 我回复最快');
 
     List<Map<String, dynamic>> formerFriends = [];
     Map<String, dynamic>? formerFriendsStats;
 
     if (includeFormerFriends) {
-      await logger.info('AnnualReport', '开始任务 14/14: 曾经的好朋友');
+      await logger.info('AnnualReport', '开始任务 13/13: 曾经的好朋友');
       final formerFriendsData =
           await analyzeFormerFriendsInBackground(
             filterYear,
@@ -1725,7 +1502,7 @@ class AnalyticsBackgroundService {
               throw TimeoutException('分析曾经的好朋友超时');
             },
           );
-      await logger.info('AnnualReport', '完成任务 14/14: 曾经的好朋友');
+      await logger.info('AnnualReport', '完成任务 13/13: 曾经的好朋友');
 
       formerFriends =
           formerFriendsData['results'] as List<Map<String, dynamic>>;
@@ -1799,7 +1576,6 @@ class AnalyticsBackgroundService {
       'midnightKing': midnightKing,
       'whoRepliesFastest': whoRepliesFastest,
       'myFastestReplies': myFastestReplies,
-      'wordCloud': wordCloudData,
       'formerFriends': formerFriends,
       'formerFriendsStats': formerFriendsStats,
     };

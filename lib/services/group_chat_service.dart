@@ -5,17 +5,7 @@ import 'package:intl/intl.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import '../models/message.dart';
 import 'database_service.dart';
-
-const Set<String> _chineseStopwords = {
-  '的', '了', '我', '你', '他', '她', '它', '们', '是', '在', '也', '有', '就',
-  '不', '都', '而', '及', '与', '且', '或', '个', '这', '那', '一',
-  '啊', '哦', '嗯', '呢', '吧', '呀', '嘛', '哈', '嘿', '哼', '哎', '唉',
-  '一个', '一些', '什么', '那个', '这个', '怎么', '我们', '你们', '他们',
-  '然后', '但是', '所以', '因为', '知道', '觉得', '就是', '没有', '现在',
-  '不是', '可以', '这么', '那么', '还有', '如果', '的话', '可能', '出来',
-  '还是', '一样', '这样', '那样', '自己', '之后', '之前', '时候',
-  '东西', '什么样', '卧槽', '我靠', '淦',
-};
+import 'word_cloud_service.dart';
 
 class GroupChatInfo {
   final String username;
@@ -84,38 +74,7 @@ class GroupChatService {
     );
   }
 
-  // --- 新增：专门用于从中文文本中提取词语（二元组合）的方法 ---
-  List<String> _tokenizeChineseForWords(String text) {
-    final words = <String>[];
-    // 正则表达式只匹配连续的汉字块
-    final chinesePattern = RegExp(r'[\u4e00-\u9fa5]+');
-    
-    final matches = chinesePattern.allMatches(text);
-    for (final match in matches) {
-      final segment = match.group(0)!;
-      // 只对长度大于等于2的汉字块进行处理
-      if (segment.length >= 2) {
-        // 使用滑动窗口生成二元词组 (bigrams)
-        for (int i = 0; i < segment.length - 1; i++) {
-          words.add(segment.substring(i, i + 2));
-        }
-      }
-      // 忽略单个汉字
-    }
-    return words;
-  }
-  
-  // --- 提取其他令牌（英文、数字、Emoji）的方法 ---
-  List<String> _tokenizeOthers(String text) {
-    final regex = RegExp(
-      r'([\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]+)|([a-zA-Z0-9]+)',
-      unicode: true,
-    );
-    
-    return regex.allMatches(text).map((m) => m.group(0)!.toLowerCase()).toList();
-  }
-
-
+  /// 获取群成员词频（使用统一词云服务）
   Future<Map<String, int>> getMemberWordFrequency({
     required String chatroomId,
     required String memberUsername,
@@ -124,53 +83,41 @@ class GroupChatService {
     int topN = 100,
   }) async {
     final endOfDay = DateTime(endDate.year, endDate.month, endDate.day, 23, 59, 59);
-    
+
     try {
       final messages = await _databaseService.getMessagesByDate(
         chatroomId,
         startDate.millisecondsSinceEpoch ~/ 1000,
         endOfDay.millisecondsSinceEpoch ~/ 1000,
       );
-      
-      final textContent = messages
-        .where((m) => 
-            m.senderUsername == memberUsername &&
-            (m.isTextMessage || m.localType == 244813135921) &&
-            m.displayContent.isNotEmpty &&
-            !m.displayContent.startsWith('[') &&
-            !m.displayContent.startsWith('<?xml') &&
-            !m.displayContent.contains('<msg>')
-        )
-        .map((m) => m.displayContent)
-        .join(' ');
-  
-      if (textContent.isEmpty) {
+
+      // 提取指定成员的文本消息
+      final textContents = messages
+          .where((m) =>
+              m.senderUsername == memberUsername &&
+              (m.isTextMessage || m.localType == 244813135921) &&
+              m.displayContent.isNotEmpty)
+          .map((m) => m.displayContent)
+          .toList();
+
+      if (textContents.isEmpty) {
         return {};
       }
-  
-      // --- 使用新的分词组合策略 ---
-      final List<String> chineseWords = _tokenizeChineseForWords(textContent);
-      final List<String> otherTokens = _tokenizeOthers(textContent);
-      
-      final allTokens = [...chineseWords, ...otherTokens];
-      
-      final wordCounts = <String, int>{};
-      for (final token in allTokens) {
-        // 过滤条件：长度至少为2，且不是停用词
-        if (token.length >= 2 && !_chineseStopwords.contains(token)) {
-          wordCounts[token] = (wordCounts[token] ?? 0) + 1;
-        }
-      }
-  
-      if (wordCounts.isEmpty) {
-        return {};
-      }
-  
-      final sortedEntries = wordCounts.entries.toList()
-        ..sort((a, b) => b.value.compareTo(a.value));
-      final topEntries = sortedEntries.take(topN);
-  
-      return Map.fromEntries(topEntries);
+
+      // 使用统一词云服务（词语模式，使用 jieba 分词）
+      final result = await WordCloudService.instance.analyze(
+        texts: WordCloudService.filterTextMessages(textContents),
+        mode: WordCloudMode.word,
+        topN: topN,
+        minCount: 1,
+        minLength: 2,
+      );
+
+      // 转换为 Map<String, int> 格式
+      return {
+        for (final item in result.words)
+          item['word'] as String: item['count'] as int
+      };
     } catch (e) {
       return {};
     }

@@ -1,6 +1,7 @@
 import 'dart:isolate';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'database_service.dart';
+import 'word_cloud_service.dart';
 import '../models/contact_record.dart';
 import '../models/contact.dart';
 
@@ -118,6 +119,11 @@ class DualReportService {
     yearlyStats['friendEmojiRankings'] = topEmoji['friendEmojiRankings'];
     await _reportProgress(onProgress, '统计年度聊天数据', '已完成', 92);
 
+    // 获取词云数据
+    await _reportProgress(onProgress, '生成常用语分析', '处理中', 94);
+    final wordCloudData = await _getWordCloudData(friendUsername, year);
+    await _reportProgress(onProgress, '生成常用语分析', '已完成', 98);
+
     final reportData = {
       'myName': myDisplayName,
       'friendUsername': friendUsername,
@@ -126,6 +132,7 @@ class DualReportService {
       'firstChat': firstChat,
       'thisYearFirstChat': thisYearFirstChat,
       'yearlyStats': yearlyStats,
+      'wordCloud': wordCloudData,
     };
     await _reportProgress(onProgress, '整理报告数据', '已完成', 100);
     return reportData;
@@ -306,6 +313,57 @@ class DualReportService {
         'voiceCount': 0,
         'emojiCount': 0,
       };
+    }
+  }
+
+  /// 获取双人对话的高频句子（词云数据）
+  /// [username] 好友的用户名
+  /// [year] 年份过滤（可选）
+  Future<Map<String, dynamic>> _getWordCloudData(
+    String username,
+    int? year,
+  ) async {
+    try {
+      // 定义时间范围
+      int startTimestamp = 0;
+      int endTimestamp = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+
+      if (year != null) {
+        final startOfYear = DateTime(year, 1, 1);
+        final endOfYear = DateTime(year, 12, 31, 23, 59, 59);
+        startTimestamp = startOfYear.millisecondsSinceEpoch ~/ 1000;
+        endTimestamp = endOfYear.millisecondsSinceEpoch ~/ 1000;
+      }
+
+      // 获取消息
+      final messages = await _databaseService.getMessagesByDate(
+        username,
+        startTimestamp,
+        endTimestamp,
+      );
+
+      if (messages.isEmpty) {
+        return {'words': [], 'totalWords': 0, 'totalMessages': 0};
+      }
+
+      // 提取文本消息内容
+      final textContents = messages
+          .where((msg) => msg.isTextMessage || msg.localType == 244813135921)
+          .where((msg) => msg.displayContent.isNotEmpty)
+          .map((msg) => msg.displayContent)
+          .toList();
+
+      // 使用统一的词云服务分析
+      final result = await WordCloudService.instance.analyze(
+        texts: WordCloudService.filterTextMessages(textContents),
+        mode: WordCloudMode.sentence,
+        topN: 50,
+        minCount: 2,
+      );
+
+      return result.toJson();
+    } catch (e) {
+      return {'words': [], 'totalWords': 0, 'totalMessages': 0};
     }
   }
 
