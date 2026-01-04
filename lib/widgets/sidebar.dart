@@ -100,7 +100,7 @@ class _SidebarState extends State<Sidebar> with SingleTickerProviderStateMixin {
               context,
               _UnsavedSettingsChoice.save,
             ),
-            child: const Text('保存配置并退出设置'),
+            child: const Text('保存配置并退出'),
           ),
         ],
       ),

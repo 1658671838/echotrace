@@ -108,7 +108,10 @@ class _SettingsPageState extends State<SettingsPage>
     final path = await _configService.getDatabasePath();
     final mode = await _configService.getDatabaseMode();
     final documentsPath = await _configService.getDocumentsPath();
-    final imageXorKey = await _configService.getImageXorKey();
+    final storedImageXorKey = await _configService.getImageXorKey();
+    final imageXorKey = storedImageXorKey == null
+        ? null
+        : _normalizeXorKey(storedImageXorKey);
     final imageAesKey = await _configService.getImageAesKey();
     final manualWxid = await _configService.getManualWxid();
     final debugMode = await _configService.getDebugMode();
