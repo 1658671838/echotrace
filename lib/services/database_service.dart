@@ -2282,6 +2282,10 @@ class DatabaseService {
       final typeCount = <int, int>{};
       final startTimestamp = startDate.millisecondsSinceEpoch ~/ 1000;
       final endTimestamp = endDate.millisecondsSinceEpoch ~/ 1000;
+      int dbErrorCount = 0;
+      int tableErrorCount = 0;
+      String? firstDbError;
+      String? firstTableError;
 
       // 使用缓存的数据库连接
       final cachedDbs = await _getCachedMessageDatabases();
@@ -2313,13 +2317,35 @@ class DatabaseService {
                 final count = row['count'] as int;
                 typeCount[type] = (typeCount[type] ?? 0) + count;
               }
-            } catch (e) {}
+            } catch (e) {
+              tableErrorCount++;
+              firstTableError ??= '$tableName: $e';
+            }
           }
-        } catch (e) {}
+        } catch (e) {
+          dbErrorCount++;
+          firstDbError ??= e.toString();
+        }
+      }
+
+      if (dbErrorCount > 0 || tableErrorCount > 0) {
+        await logger.warning(
+          'DatabaseService',
+          'getAllMessageTypeDistributionByRange completed with errors: '
+          'dbFailures=$dbErrorCount, tableFailures=$tableErrorCount, '
+          'firstDbError=${firstDbError ?? "n/a"}, '
+          'firstTableError=${firstTableError ?? "n/a"}',
+        );
       }
 
       return typeCount;
-    } catch (e) {
+    } catch (e, stackTrace) {
+      await logger.error(
+        'DatabaseService',
+        'getAllMessageTypeDistributionByRange failed',
+        e,
+        stackTrace,
+      );
       return {};
     }
   }
